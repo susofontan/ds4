@@ -6526,6 +6526,21 @@ static bool qwen_param_declared_string(const tool_schema_orders *orders,
     return false;
 }
 
+/* Qwen writes the invoke name and parameter key as the tag body
+ * (<function=name>, <parameter=key>) instead of name="..." attributes, so the
+ * shared DSML attribute reader cannot see them. */
+static char *qwen_stream_tag_value(const char *tag) {
+    if (!tag) return NULL;
+    const char *p = strchr(tag, '=');
+    if (!p) return NULL;
+    p++;
+    const char *end = p + strcspn(p, "<>");
+    const char *start = p;
+    trim_const_span(&start, &end);
+    if (end <= start) return NULL;
+    return xstrndup(start, (size_t)(end - start));
+}
+
 static bool parse_qwen_generated_message_ex(const char *text,
                                             bool require_thinking_closed,
                                             char **content_out,
@@ -7172,6 +7187,12 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    /* Qwen reuses the DSML state machine with a different grammar; these
+     * fields keep the Qwen-only pieces (tag bodies, schema-typed values and
+     * the template's value newlines) out of the DeepSeek path. */
+    bool qwen;
+    bool param_value_started;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7199,6 +7220,8 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
+    free(ts->tool_name);
+    ts->tool_name = NULL;
     ts->ids = NULL;
     ts->ids_cap = 0;
 }
@@ -7841,6 +7864,14 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
         ts->invoke_end = DS4_INVOKE_END_SHORT;
         ts->param_start = DS4_PARAM_START_SHORT;
         ts->param_end = DS4_PARAM_END_SHORT;
+    } else if (raw_full_lit(raw, raw_len, pos, "<tool_call>")) {
+        ts->parse_pos += strlen("<tool_call>");
+        ts->tool_calls_end = "</tool_call>";
+        ts->invoke_start = "<function=";
+        ts->invoke_end = "</function>";
+        ts->param_start = "<parameter=";
+        ts->param_end = "</parameter>";
+        ts->qwen = true;
     } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
         ts->parse_pos += strlen("<tool_calls>");
         ts->tool_calls_end = "</tool_calls>";
@@ -7868,9 +7899,13 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
+    char *name = ts->qwen ? qwen_stream_tag_value(tag) : dsml_attr(tag, "name");
     free(tag);
     if (!name) return openai_tool_stream_fail(ts);
+    if (ts->qwen) {
+        free(ts->tool_name);
+        ts->tool_name = xstrdup(name);
+    }
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
@@ -7892,21 +7927,35 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name || !is_string) {
-        free(name);
+    char *name;
+    bool string_value;
+    if (ts->qwen) {
+        name = qwen_stream_tag_value(tag);
+        free(tag);
+        if (!name) return openai_tool_stream_fail(ts);
+        /* The Qwen template does not mark value types, so the tool schema is
+         * the only place that says whether a value may be streamed as a JSON
+         * string.  Unknown and non-string parameters are flushed whole at the
+         * closing tag, where the value decides string vs JSON. */
+        string_value = qwen_param_declared_string(&r->tool_orders, ts->tool_name, name);
+    } else {
+        char *is_string = dsml_attr(tag, "string");
+        name = dsml_attr(tag, "name");
+        free(tag);
+        if (!name || !is_string) {
+            free(name);
+            free(is_string);
+            return openai_tool_stream_fail(ts);
+        }
+        string_value = !strcmp(is_string, "true");
         free(is_string);
-        return openai_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
     bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
     free(name);
-    free(is_string);
     if (!ok) return false;
 
     ts->param_is_string = string_value;
+    ts->param_value_started = false;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
@@ -7915,6 +7964,35 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
 static bool openai_tool_finish_param(int fd, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t value_end) {
+    if (ts->qwen) {
+        /* qwen_strip_value_newlines() drops the single template newline
+         * before the closing tag; mirror it so streamed args match the final
+         * parsed JSON exactly.  Keep the true tag start for parse_pos. */
+        size_t content_end = value_end;
+        if (content_end > ts->parse_pos && raw[content_end - 1] == '\n') content_end--;
+        if (ts->param_is_string) {
+            if (content_end > ts->parse_pos &&
+                !openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
+                                               content_end - ts->parse_pos)) return false;
+            if (!openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+        } else {
+            char *value = xstrndup(raw + ts->parse_pos, content_end - ts->parse_pos);
+            bool string_value = !qwen_param_value_is_json(value);
+            bool ok;
+            if (string_value) {
+                ok = openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1) &&
+                     openai_tool_emit_string_value(fd, r, id, ts, value, strlen(value)) &&
+                     openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1);
+            } else {
+                ok = openai_tool_emit_args_fragment(fd, r, id, ts, value, strlen(value));
+            }
+            free(value);
+            if (!ok) return false;
+        }
+        ts->parse_pos = value_end + strlen(ts->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
@@ -7937,6 +8015,30 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
+            if (ts->qwen) {
+                /* Qwen repeats <tool_call>...</tool_call> once per call in a
+                 * turn, so the wrapper close is not the end of the block. */
+                if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
+                    ts->parse_pos += strlen(ts->tool_calls_end);
+                    continue;
+                }
+                if (raw_full_lit(raw, raw_len, ts->parse_pos, "<tool_call>")) {
+                    ts->parse_pos += strlen("<tool_call>");
+                    continue;
+                }
+                if (raw_partial_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end) ||
+                    raw_partial_lit(raw, raw_len, ts->parse_pos, "<tool_call>") ||
+                    raw_partial_lit(raw, raw_len, ts->parse_pos, ts->invoke_start))
+                    return true;
+                if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
+                    size_t before_pos = ts->parse_pos;
+                    dsml_tool_stream_state before_state = ts->state;
+                    if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
+                    if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                    continue;
+                }
+                return openai_tool_stream_fail(ts);
+            }
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->tool_calls_end);
                 ts->active = false;
@@ -7975,6 +8077,41 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                 continue;
             }
             return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_PARAM_VALUE && ts->qwen) {
+            /* Drop the one template newline after the tag, but only once.
+             * The leading byte may not have arrived with the tag itself. */
+            if (!ts->param_value_started && ts->parse_pos < raw_len) {
+                ts->param_value_started = true;
+                if (raw[ts->parse_pos] == '\n') ts->parse_pos++;
+            }
+            if (ts->parse_pos >= raw_len) return true;
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->param_end);
+            if (end) {
+                if (!openai_tool_finish_param(fd, r, id, ts, raw,
+                                              (size_t)(end - raw))) return false;
+                continue;
+            }
+            /* Non-string values are usually short and their JSON-vs-string
+             * shape is only known once complete, so wait for the closing tag
+             * and let finish_param classify them. */
+            if (!ts->param_is_string) return true;
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len, ts->param_end,
+                                                            true);
+            /* Withhold the template newline before </parameter>.  If more
+             * value follows, it is emitted on the next update as literal. */
+            if (limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
+            if (limit > ts->parse_pos) {
+                if (!openai_tool_emit_string_value(fd, r, id, ts,
+                                                   raw + ts->parse_pos,
+                                                   limit - ts->parse_pos)) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
         }
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
@@ -9159,6 +9296,9 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool qwen;
+    bool param_value_started;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } anthropic_tool_stream;
@@ -9209,6 +9349,8 @@ static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
+    free(ts->tool_name);
+    ts->tool_name = NULL;
     ts->ids = NULL;
     ts->ids_cap = 0;
 }
@@ -9419,6 +9561,12 @@ static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
+    if (raw_full_lit(raw, raw_len, pos, "<tool_call>")) {
+        ts->syn = &qwen_tool_syntax;
+        ts->qwen = true;
+        ts->parse_pos = pos + strlen("<tool_call>");
+        return true;
+    }
     for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
         const dsml_syntax *syn = &dsml_syntaxes[i];
         if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
@@ -9445,9 +9593,13 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
+    char *name = ts->qwen ? qwen_stream_tag_value(tag) : dsml_attr(tag, "name");
     free(tag);
     if (!name) return anthropic_tool_stream_fail(ts);
+    if (ts->qwen) {
+        free(ts->tool_name);
+        ts->tool_name = xstrdup(name);
+    }
 
     /* This id is already visible to the client.  After final parsing,
      * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
@@ -9467,28 +9619,39 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     return true;
 }
 
-static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
+static bool anthropic_tool_start_param(int fd, const request *r,
+                                       anthropic_stream *st,
                                        const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name || !is_string) {
-        free(name);
+    char *name;
+    bool string_value;
+    if (ts->qwen) {
+        name = qwen_stream_tag_value(tag);
+        free(tag);
+        if (!name) return anthropic_tool_stream_fail(ts);
+        string_value = qwen_param_declared_string(&r->tool_orders, ts->tool_name, name);
+    } else {
+        char *is_string = dsml_attr(tag, "string");
+        name = dsml_attr(tag, "name");
+        free(tag);
+        if (!name || !is_string) {
+            free(name);
+            free(is_string);
+            return anthropic_tool_stream_fail(ts);
+        }
+        string_value = !strcmp(is_string, "true");
         free(is_string);
-        return anthropic_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
     bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
     free(name);
-    free(is_string);
     if (!ok) return false;
 
     ts->param_is_string = string_value;
+    ts->param_value_started = false;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
@@ -9497,6 +9660,32 @@ static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
 static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
                                         const char *raw, size_t value_end) {
     anthropic_tool_stream *ts = &st->tool;
+    if (ts->qwen) {
+        size_t content_end = value_end;
+        if (content_end > ts->parse_pos && raw[content_end - 1] == '\n') content_end--;
+        if (ts->param_is_string) {
+            if (content_end > ts->parse_pos &&
+                !anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
+                                                  content_end - ts->parse_pos)) return false;
+            if (!anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
+        } else {
+            char *value = xstrndup(raw + ts->parse_pos, content_end - ts->parse_pos);
+            bool string_value = !qwen_param_value_is_json(value);
+            bool ok;
+            if (string_value) {
+                ok = anthropic_tool_emit_args_fragment(fd, st, "\"", 1) &&
+                     anthropic_tool_emit_string_value(fd, st, value, strlen(value)) &&
+                     anthropic_tool_emit_args_fragment(fd, st, "\"", 1);
+            } else {
+                ok = anthropic_tool_emit_args_fragment(fd, st, value, strlen(value));
+            }
+            free(value);
+            if (!ok) return false;
+        }
+        ts->parse_pos = value_end + strlen(ts->syn->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
@@ -9512,7 +9701,8 @@ static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
     return true;
 }
 
-static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
+static bool anthropic_tool_stream_update(int fd, server *s, const request *r,
+                                         const char *id,
                                          anthropic_stream *st,
                                          const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
@@ -9520,6 +9710,28 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
+            if (ts->qwen) {
+                if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
+                    ts->parse_pos += strlen(ts->syn->tool_calls_end);
+                    continue;
+                }
+                if (raw_full_lit(raw, raw_len, ts->parse_pos, "<tool_call>")) {
+                    ts->parse_pos += strlen("<tool_call>");
+                    continue;
+                }
+                if (raw_partial_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end) ||
+                    raw_partial_lit(raw, raw_len, ts->parse_pos, "<tool_call>") ||
+                    raw_partial_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start))
+                    return true;
+                if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
+                    size_t before_pos = ts->parse_pos;
+                    dsml_tool_stream_state before_state = ts->state;
+                    if (!anthropic_tool_start_invoke(fd, s, st, raw, raw_len)) return false;
+                    if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                    continue;
+                }
+                return anthropic_tool_stream_fail(ts);
+            }
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->syn->tool_calls_end);
                 ts->active = false;
@@ -9556,11 +9768,40 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_param(fd, st, raw, raw_len)) return false;
+                if (!anthropic_tool_start_param(fd, r, st, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
             return anthropic_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_PARAM_VALUE && ts->qwen) {
+            if (!ts->param_value_started && ts->parse_pos < raw_len) {
+                ts->param_value_started = true;
+                if (raw[ts->parse_pos] == '\n') ts->parse_pos++;
+            }
+            if (ts->parse_pos >= raw_len) return true;
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->syn->param_end);
+            if (end) {
+                if (!anthropic_tool_finish_param(fd, st, raw,
+                                                 (size_t)(end - raw))) return false;
+                continue;
+            }
+            if (!ts->param_is_string) return true;
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len,
+                                                            ts->syn->param_end,
+                                                            true);
+            if (limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
+            if (limit > ts->parse_pos) {
+                if (!anthropic_tool_emit_string_value(fd, st,
+                                                      raw + ts->parse_pos,
+                                                      limit - ts->parse_pos)) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
         }
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
@@ -9762,7 +10003,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TOOL) {
-        if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        if (!anthropic_tool_stream_update(fd, s, r, id, st, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
@@ -13767,6 +14008,7 @@ decode_again:
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
+    double last_keepalive_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
@@ -14059,6 +14301,44 @@ decode_again:
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
                 next_decode_log += 50;
+                /* Mirror the prefill keepalive for the decode phase.  Tool
+                 * calls stream incrementally on OpenAI/Anthropic, but a
+                 * suppressed block and Responses reasoning the client did not
+                 * ask to summarize can stay byte-idle for minutes; a `:`
+                 * comment keeps proxies and client idle timers from closing
+                 * the connection.  Codex' Responses parser only ingests
+                 * function_call items at output_item.done, so there is nothing
+                 * useful to send while the call is still being generated. */
+                if (j->req.stream) {
+                    /* Include the tool modes: an argument that is buffered
+                     * until its closing tag (unknown schema, JSON value)
+                     * produces no deltas either.  Comments are free to send
+                     * alongside normal deltas, so being conservative here
+                     * costs nothing. */
+                    const bool stream_silent =
+                        (openai_live_chat &&
+                         (openai_live.mode == OPENAI_STREAM_TOOL ||
+                          openai_live.mode == OPENAI_STREAM_SUPPRESS)) ||
+                        (responses_live_chat &&
+                         (responses_live.mode == RESP_STREAM_SUPPRESS ||
+                          (responses_live.mode == RESP_STREAM_THINKING &&
+                           !j->req.reasoning_summary_emit))) ||
+                        (j->req.api == API_ANTHROPIC &&
+                         (anthropic_live.mode == ANTH_STREAM_TOOL ||
+                          anthropic_live.mode == ANTH_STREAM_SUPPRESS));
+                    const double now = now_sec();
+                    if (stream_silent && now - last_keepalive_t >= 5.0) {
+                        static const char ka[] = ": decode\n\n";
+                        if (!send_all(j->fd, ka, sizeof(ka) - 1)) {
+                            job_mark_cancelled(j);
+                            finish = "error";
+                            snprintf(err, sizeof(err), "client stream write failed");
+                            stop_decode = true;
+                            break;
+                        }
+                        last_keepalive_t = now;
+                    }
+                }
             }
 
             if (hit_stop) {
@@ -16602,6 +16882,71 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     close(sv[1]);
 }
 
+static void test_anthropic_qwen_tool_stream_sends_live_tool_use(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_qwen_tool", 7, &st));
+
+    const char *raw =
+        "Before.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho partial";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_qwen_tool", &st,
+                                            raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho partial done\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_qwen_tool", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw_complete, false,
+        &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    apply_anthropic_stream_tool_ids(&calls, &st);
+    TEST_ASSERT(calls.v[0].id != NULL);
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_qwen_tool", &st,
+                                          raw_complete, strlen(raw_complete),
+                                          &calls, "tool_calls", 5));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"text\":\"Before.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_use\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"partial_json\":\"echo partial\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"partial_json\":\" done\"") != NULL);
+    TEST_ASSERT(strstr(out, "done\\n") == NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_anthropic_usage_reports_cache_details(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -17023,6 +17368,251 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static tool_schema_orders make_qwen_run_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"run\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},"
+        "\"timeout\":{\"type\":\"integer\"}}}}");
+    return orders;
+}
+
+static tool_schema_orders make_qwen_object_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"run\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"options\":{\"type\":\"object\"}}}}");
+    return orders;
+}
+
+/* Qwen renders <tool_call><function=...><parameter=...>; the live projection
+ * must stream the declared-string arguments instead of hiding the whole call
+ * until it completes, or a large file write looks like a hung connection. */
+static void test_openai_qwen_tool_stream_sends_partial_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_qwen_tool", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *partial =
+        "Working.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho partial";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                         partial, strlen(partial), false));
+
+    const char *complete =
+        "Working.\n\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho partial done\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                         complete, strlen(complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, complete, false,
+        &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+    apply_openai_stream_tool_ids(&calls, &st);
+    TEST_ASSERT(calls.v[0].id != NULL);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                       complete, strlen(complete), &calls,
+                                       "tool_calls", 10, 6));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"content\":\"Working.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"echo partial\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\" done\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"}\"") != NULL);
+    /* The template newline before </parameter> must not reach the client. */
+    TEST_ASSERT(strstr(out, "done\\n") == NULL);
+    /* The raw Qwen protocol must never leak as assistant text. */
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_classifies_typed_parameters(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_qwen_run_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<tool_call>\n<function=run>\n"
+        "<parameter=command>\nls\n</parameter>\n"
+        "<parameter=timeout>\n10\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_typed", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* A declared string streams quoted... */
+    TEST_ASSERT(strstr(out, "\\\"command\\\":\\\"") != NULL);
+    /* ...while a declared integer waits for the closing tag and stays JSON. */
+    TEST_ASSERT(strstr(out, "\\\"timeout\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"timeout\\\":\\\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"10\"") != NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_handles_multiple_calls(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_multi", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    int tool_id_count = 0;
+    for (const char *p = out; (p = strstr(p, "\"id\":\"call_")) != NULL; p++) tool_id_count++;
+    TEST_ASSERT(tool_id_count == 2);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"ls\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"pwd\"") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_accepts_inline_values(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    /* Some Qwen templates place the value right after the tag and close it
+     * without the template newlines; the projection must not invent any. */
+    const char *raw =
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>ls -la</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_inline", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"ls -la\"") != NULL);
+    TEST_ASSERT(strstr(out, "ls -la\\n") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_emits_json_objects_raw(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_qwen_object_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<tool_call>\n<function=run>\n"
+        "<parameter=options>\n{\"a\": 1}\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_object", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* Non-string parameters keep their JSON shape: no extra quote after the
+     * colon and the object body is emitted verbatim. */
+    TEST_ASSERT(strstr(out, "\\\"options\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"options\\\":\\\"") == NULL);
+    TEST_ASSERT(strstr(out, "\\\"a\\\": 1") != NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
     openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
@@ -22077,6 +22667,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
+    test_anthropic_qwen_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
@@ -22084,6 +22675,11 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
+    test_openai_qwen_tool_stream_sends_partial_arguments();
+    test_openai_qwen_tool_stream_classifies_typed_parameters();
+    test_openai_qwen_tool_stream_handles_multiple_calls();
+    test_openai_qwen_tool_stream_accepts_inline_values();
+    test_openai_qwen_tool_stream_emits_json_objects_raw();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_preserves_literal_entities();
