@@ -17344,6 +17344,14 @@ static tool_schema_orders make_qwen_run_order(void) {
     return orders;
 }
 
+static tool_schema_orders make_qwen_object_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"run\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"options\":{\"type\":\"object\"}}}}");
+    return orders;
+}
+
 /* Qwen renders <tool_call><function=...><parameter=...>; the live projection
  * must stream the declared-string arguments instead of hiding the whole call
  * until it completes, or a large file write looks like a hung connection. */
@@ -17487,6 +17495,83 @@ static void test_openai_qwen_tool_stream_handles_multiple_calls(void) {
     TEST_ASSERT(strstr(out, "\"arguments\":\"ls\"") != NULL);
     TEST_ASSERT(strstr(out, "\"arguments\":\"pwd\"") != NULL);
     TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_accepts_inline_values(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    /* Some Qwen templates place the value right after the tag and close it
+     * without the template newlines; the projection must not invent any. */
+    const char *raw =
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>ls -la</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_inline", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"ls -la\"") != NULL);
+    TEST_ASSERT(strstr(out, "ls -la\\n") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_emits_json_objects_raw(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_qwen_object_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<tool_call>\n<function=run>\n"
+        "<parameter=options>\n{\"a\": 1}\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_object", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* Non-string parameters keep their JSON shape: no extra quote after the
+     * colon and the object body is emitted verbatim. */
+    TEST_ASSERT(strstr(out, "\\\"options\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"options\\\":\\\"") == NULL);
+    TEST_ASSERT(strstr(out, "\\\"a\\\": 1") != NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
 
     free(out);
     openai_stream_free(&st);
@@ -22554,6 +22639,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_qwen_tool_stream_sends_partial_arguments();
     test_openai_qwen_tool_stream_classifies_typed_parameters();
     test_openai_qwen_tool_stream_handles_multiple_calls();
+    test_openai_qwen_tool_stream_accepts_inline_values();
+    test_openai_qwen_tool_stream_emits_json_objects_raw();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_preserves_literal_entities();
