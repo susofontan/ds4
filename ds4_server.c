@@ -14008,6 +14008,7 @@ decode_again:
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
+    double last_keepalive_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
@@ -14300,6 +14301,44 @@ decode_again:
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
                 next_decode_log += 50;
+                /* Mirror the prefill keepalive for the decode phase.  Tool
+                 * calls stream incrementally on OpenAI/Anthropic, but a
+                 * suppressed block and Responses reasoning the client did not
+                 * ask to summarize can stay byte-idle for minutes; a `:`
+                 * comment keeps proxies and client idle timers from closing
+                 * the connection.  Codex' Responses parser only ingests
+                 * function_call items at output_item.done, so there is nothing
+                 * useful to send while the call is still being generated. */
+                if (j->req.stream) {
+                    /* Include the tool modes: an argument that is buffered
+                     * until its closing tag (unknown schema, JSON value)
+                     * produces no deltas either.  Comments are free to send
+                     * alongside normal deltas, so being conservative here
+                     * costs nothing. */
+                    const bool stream_silent =
+                        (openai_live_chat &&
+                         (openai_live.mode == OPENAI_STREAM_TOOL ||
+                          openai_live.mode == OPENAI_STREAM_SUPPRESS)) ||
+                        (responses_live_chat &&
+                         (responses_live.mode == RESP_STREAM_SUPPRESS ||
+                          (responses_live.mode == RESP_STREAM_THINKING &&
+                           !j->req.reasoning_summary_emit))) ||
+                        (j->req.api == API_ANTHROPIC &&
+                         (anthropic_live.mode == ANTH_STREAM_TOOL ||
+                          anthropic_live.mode == ANTH_STREAM_SUPPRESS));
+                    const double now = now_sec();
+                    if (stream_silent && now - last_keepalive_t >= 5.0) {
+                        static const char ka[] = ": decode\n\n";
+                        if (!send_all(j->fd, ka, sizeof(ka) - 1)) {
+                            job_mark_cancelled(j);
+                            finish = "error";
+                            snprintf(err, sizeof(err), "client stream write failed");
+                            stop_decode = true;
+                            break;
+                        }
+                        last_keepalive_t = now;
+                    }
+                }
             }
 
             if (hit_stop) {
