@@ -71900,6 +71900,18 @@ bool ds4_engine_has_vision(ds4_engine *e) {
     return e && e->vision_ready;
 }
 
+bool ds4_engine_vision_layout_can_stub(ds4_engine *e) {
+    /* Only the Qwen3.8 layout is currently rebuilt without the encoder.  The
+     * DeepSeek block layout depends on the token position, and the GLM path is
+     * left on the original encode-everything behaviour until it is verified.
+     * Tensor-parallel and pipeline-distributed runs also mirror the spans
+     * across ranks, so they keep every embedding local. */
+    return e && e->vision_ready &&
+           e->vision_kind == DS4_VISION_QWEN4 &&
+           !e->tp.active &&
+           e->distributed.role == DS4_DISTRIBUTED_NONE;
+}
+
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
     if (!embedding) return;
     free(embedding->data);
@@ -72054,6 +72066,35 @@ static int ds4_prompt_append_deepseek4_vision(
     return 0;
 }
 #endif
+
+int ds4_prompt_append_vision_stub(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        ds4_vision_span *span,
+        uint32_t token_count,
+        const uint8_t fingerprint[32],
+        char *error,
+        size_t error_cap) {
+    if (!e || !tokens || !span || token_count == 0 || !e->vision_ready ||
+        e->vision_kind == DS4_VISION_DEEPSEEK4) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "cannot rebuild image placeholder without encoding");
+        return 0;
+    }
+    if ((uint64_t)tokens->len + token_count + 2u > INT_MAX) {
+        if (error && error_cap) snprintf(error, error_cap, "vision prompt is too large");
+        return 0;
+    }
+    memset(span, 0, sizeof(*span));
+    ds4_tokens_push(tokens, e->vision_start_token);
+    span->token_start = (uint32_t)tokens->len;
+    for (uint32_t i = 0; i < token_count; i++)
+        ds4_tokens_push(tokens, e->vision_image_token);
+    ds4_tokens_push(tokens, e->vision_end_token);
+    span->embedding.token_count = token_count;
+    if (fingerprint) memcpy(span->embedding.fingerprint, fingerprint, 32);
+    return 1;
+}
 
 int ds4_prompt_append_vision(
         ds4_engine *e,
@@ -72398,6 +72439,61 @@ int ds4_engine_vision_encode_memory(
     ds4_image image = {0};
     if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    ds4_image_free(&image);
+    return ok;
+}
+
+/* Decode one image and report what the encoder would need to know about it,
+ * without running the GPU encoder.  The token count only depends on the image
+ * pixels for the simple start/image.../end layout, so the caller can rebuild a
+ * placeholder for an image that is already covered by a live KV prefix. */
+int ds4_engine_vision_measure_memory(
+        ds4_engine *e,
+        const uint8_t *encoded,
+        size_t encoded_len,
+        uint32_t *token_count,
+        uint8_t fingerprint[32],
+        char *error,
+        size_t error_cap) {
+    if (!e || !e->vision_ready) {
+        if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
+        return 0;
+    }
+    if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
+        /* The DeepSeek block layout also depends on the token position, so a
+         * content-only measurement cannot reconstruct it. */
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision layout cannot be measured without encoding");
+        return 0;
+    }
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap))
+        return 0;
+    uint32_t tokens = 0;
+    int ok = 0;
+    if (e->vision_kind == DS4_VISION_QWEN4) {
+#ifdef DS4_HAS_QWEN4_GPU
+        ds4_image_patches patches = {0};
+        ok = ds4_image_preprocess_qwen4(&patches, &image, 64u,
+                                        qwen4_vision_max_tokens(), error, error_cap);
+        tokens = patches.image_token_count;
+        ds4_image_patches_free(&patches);
+#else
+        if (error && error_cap)
+            snprintf(error, error_cap, "Qwen3.8 vision is not compiled in");
+#endif
+    } else {
+        ds4_image_patches patches = {0};
+        ok = ds4_image_preprocess_glm53(&patches, &image, 16u, 8000u, error, error_cap);
+        tokens = patches.image_token_count;
+        ds4_image_patches_free(&patches);
+    }
+    if (ok && tokens) {
+        if (token_count) *token_count = tokens;
+        if (fingerprint) memcpy(fingerprint, image.fingerprint, sizeof(image.fingerprint));
+    } else {
+        ok = 0;
+    }
     ds4_image_free(&image);
     return ok;
 }
@@ -74884,6 +74980,22 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  */
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 
+size_t ds4_session_checkpoint_image_count(const ds4_session *s) {
+    return s && s->checkpoint_valid ? s->checkpoint_image_count : 0;
+}
+
+bool ds4_session_checkpoint_image_identity(const ds4_session *s,
+                                           size_t index,
+                                           uint32_t *token_count,
+                                           uint8_t fingerprint[32]) {
+    if (!s || !s->checkpoint_valid || index >= s->checkpoint_image_count)
+        return false;
+    if (token_count) *token_count = s->checkpoint_images[index].token_count;
+    if (fingerprint)
+        memcpy(fingerprint, s->checkpoint_images[index].fingerprint, 32);
+    return true;
+}
+
 bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
@@ -75145,12 +75257,29 @@ int ds4_session_sync_multimodal(
         snprintf(err, errlen, "vision encoder is not loaded");
         return 1;
     }
+    /* A prefix of the incoming images may already be resident in the live KV.
+     * Those spans do not need embedding data as long as the checkpoint stays a
+     * prefix of the prompt: the graph only consumes rows at or after the
+     * checkpoint frontier.  Any span that would be evaluated must still carry
+     * its embedding, so a rebuild with stubbed spans is rejected instead of
+     * reading missing data. */
+    const bool checkpoint_prefix =
+        s->checkpoint_valid && ds4_tokens_starts_with(prompt, &s->checkpoint);
     uint64_t previous_end = 0;
     for (size_t i = 0; i < image_count; i++) {
         const ds4_vision_span *span = &images[i];
         const uint64_t end = (uint64_t)span->token_start +
                              span->embedding.token_count;
-        if (!span->embedding.data || span->embedding.token_count == 0 ||
+        const bool covered = !span->embedding.data && checkpoint_prefix &&
+                             i < s->checkpoint_image_count &&
+                             s->checkpoint_images[i].token_start == span->token_start &&
+                             s->checkpoint_images[i].token_count == span->embedding.token_count &&
+                             end <= (uint64_t)s->checkpoint.len &&
+                             memcmp(s->checkpoint_images[i].fingerprint,
+                                    span->embedding.fingerprint,
+                                    sizeof(s->checkpoint_images[i].fingerprint)) == 0;
+        if ((!span->embedding.data && !covered) ||
+            span->embedding.token_count == 0 ||
             span->token_start < previous_end || end > (uint64_t)prompt->len) {
             snprintf(err, errlen, "invalid or overlapping image token span");
             return 1;

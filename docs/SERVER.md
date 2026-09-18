@@ -98,8 +98,16 @@ Start with the matching language GGUF and `--vision FILE`; see
 
 OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
-Image blocks preserve their order in the request. The limit is 16 images and
-a 64 MiB HTTP body.
+Image blocks preserve their order in the request. The body is limited to
+64 MiB. There is no fixed image count limit: every image is measured on the
+CPU (decode plus preprocess, no encoder) so the full prompt length is known
+before any GPU work, and the normal context check is the only bound. Like
+llama.cpp's `mtmd_tokenize`, this lets a transcript with many historical
+images be resumed even when nothing is cached yet. Qwen3.8 additionally
+defers encoding to the request worker, which encodes only the images the live
+KV does not already cover; a covered image is recognized by content
+fingerprint. A pathological request above 1024 images is rejected without
+measuring them.
 
 ## Disk KV cache
 

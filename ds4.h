@@ -262,6 +262,10 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
 bool ds4_engine_has_vision(ds4_engine *e);
+/* True when an image placeholder can be rebuilt from its content alone, which
+ * lets the server skip re-encoding images already covered by a live KV prefix.
+ * Currently only the Qwen3.8 layout; other kinds keep encoding every image. */
+bool ds4_engine_vision_layout_can_stub(ds4_engine *e);
 int ds4_engine_vision_encode_file(ds4_engine *e,
                                   const char *path,
                                   ds4_vision_embedding *out,
@@ -274,12 +278,34 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     char *error,
                                     size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
+/* CPU-only measurement of one encoded image: decode it, report its content
+ * fingerprint and the number of vision tokens it would occupy for this
+ * engine's vision kind, without running the vision encoder.  Returns 0 when
+ * the placeholder layout depends on the token position (DeepSeek V4/V4.1),
+ * where callers must run the real encoder instead. */
+int ds4_engine_vision_measure_memory(ds4_engine *e,
+                                     const uint8_t *encoded,
+                                     size_t encoded_len,
+                                     uint32_t *token_count,
+                                     uint8_t fingerprint[32],
+                                     char *error,
+                                     size_t error_cap);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
                              ds4_vision_span *span,
                              ds4_vision_embedding *embedding,
                              char *error,
                              size_t error_cap);
+/* Append the placeholder token block for an image whose embedding already
+ * lives in a reusable live KV prefix, without re-running the encoder.  Only
+ * valid for the simple start/image.../end layout. */
+int ds4_prompt_append_vision_stub(ds4_engine *e,
+                                  ds4_tokens *tokens,
+                                  ds4_vision_span *span,
+                                  uint32_t token_count,
+                                  const uint8_t fingerprint[32],
+                                  char *error,
+                                  size_t error_cap);
 /* Append one user or tool message whose text parts alternate with images.
  * text_parts must contain image_count + 1 entries. On success ownership of
  * each embedding is transferred to the corresponding output span. */
@@ -451,6 +477,14 @@ int ds4_session_sync_multimodal(ds4_session *s,
 bool ds4_session_vision_prefix_matches(const ds4_session *s,
                                        const ds4_vision_span *images,
                                        size_t image_count);
+/* Number of leading images retained by a valid live checkpoint. */
+size_t ds4_session_checkpoint_image_count(const ds4_session *s);
+/* Copy the token count and content fingerprint of a retained checkpoint
+ * image.  Returns false when the checkpoint or index is unavailable. */
+bool ds4_session_checkpoint_image_identity(const ds4_session *s,
+                                           size_t index,
+                                           uint32_t *token_count,
+                                           uint8_t fingerprint[32]);
 /* Like the prefix check, but also require exactly the same image count. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
