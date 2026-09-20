@@ -48185,6 +48185,12 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    /* BF16-spine hyper-connection variants (appended to keep existing ids) */
+    QWEN4_K_HC_NORM_BF16,
+    QWEN4_K_HC_NORM_REUSE_BF16,
+    QWEN4_K_HC_GATE_MIX_BF16,
+    QWEN4_K_HC_GATE_MIX_PAIR_BF16,
+    QWEN4_K_HC_COMBINE_NORM_BF16,
     QWEN4_K_COUNT,
 };
 
@@ -48290,6 +48296,11 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen4_hc_norm_bf16",
+    "kernel_qwen4_hc_norm_reuse_bf16",
+    "kernel_qwen4_hc_gate_mix_bf16",
+    "kernel_qwen4_hc_gate_mix_pair_bf16",
+    "kernel_qwen4_hc_combine_norm_bf16",
 };
 
 typedef struct {
@@ -48457,13 +48468,19 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
     return qwen4_dispatch_resident(kernel, args, args_len, binds, n_binds, grid, tg, tg_mem, NULL, 0u);
 }
 
-/* bytes of one hc mixer row of n elements: f16, f32 or q8_0 */
+/* bytes of one hc mixer row of n elements: f16, f32, bf16 or q8_0 */
 static uint64_t qwen4_hc_row_bytes(uint32_t weight_type, uint64_t n) {
-    return weight_type == 1u ? n * 2u : weight_type == 0u ? n * 4u : weight_type == 8u ? (n / 32u) * 34u : 0u;
+    return weight_type == 1u ? n * 2u : weight_type == 0u ? n * 4u : weight_type == 30u ? n * 2u :
+           weight_type == 8u ? (n / 32u) * 34u : 0u;
 }
 
-static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8) {
-    return weight_type == 1u ? k16 : weight_type == 0u ? k32 : kq8;
+/* bytes of a 1-D f32/f16/bf16 vector of n elements (0 for unsupported) */
+static uint64_t qwen4_vec_bytes(uint32_t type, uint64_t n) {
+    return type == 0u ? n * 4u : (type == 1u || type == 30u) ? n * 2u : 0u;
+}
+
+static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8, int kbf16) {
+    return weight_type == 1u ? k16 : weight_type == 0u ? k32 : weight_type == 30u ? kbf16 : kq8;
 }
 
 static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
@@ -48491,18 +48508,20 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
-        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
+        uint32_t weight_type, uint32_t gamma_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, dim);
+    const uint64_t gbytes = qwen4_vec_bytes(gamma_type, dim);
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
-        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
+        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, gamma_type };
     qwen4_bind b[8];
-    if (n_tokens != 1u || weight_type != 1u || n_inject != n_hc) return 0;
+    if (n_tokens != 1u || (weight_type != 1u && weight_type != 30u) || n_inject != n_hc) return 0;
     if (ds4_gpu_tensor_buffer(next_R) == ds4_gpu_tensor_buffer(R) ||
         ds4_gpu_tensor_buffer(inj_part) == ds4_gpu_tensor_buffer(old_inj)) return 0;
-    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || gbytes == 0 ||
+        (dim % 32) != 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, gbytes, "hc norm gamma") ||
         !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output")) {
         return 0;
     }
@@ -48520,22 +48539,25 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
     if (!qwen4_bind_tensor(&b[5], next_R, dim * sizeof(float), "combine norm next R") ||
         !qwen4_bind_tensor(&b[6], blk, n_embd * sizeof(float), "combine norm block") ||
         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
-    return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
+    return qwen4_dispatch(weight_type == 30u ? QWEN4_K_HC_COMBINE_NORM_BF16 : QWEN4_K_HC_COMBINE_NORM,
+        &args, sizeof(args), b, 8,
         MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
-        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
+        uint32_t weight_type, uint32_t gamma_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, dim);
+    const uint64_t gbytes = qwen4_vec_bytes(gamma_type, dim);
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
-        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
+        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, gamma_type };
     qwen4_bind b[5];
-    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || gbytes == 0 ||
+        (dim % 32) != 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, gbytes, "hc norm gamma") ||
         !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output")) {
         return 0;
     }
@@ -48563,8 +48585,10 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         }
     }
     const int kernel = reuse
-        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
-        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
+        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32,
+                          QWEN4_K_HC_NORM_REUSE_Q8, QWEN4_K_HC_NORM_REUSE_BF16)
+        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32,
+                          QWEN4_K_HC_NORM_Q8, QWEN4_K_HC_NORM_BF16);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
                           MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
@@ -48592,10 +48616,11 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
-                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
+                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8,
+                                              QWEN4_K_HC_GATE_MIX_PAIR_BF16))
                             : prefetch ? QWEN4_K_HC_GATE_MIX_F16_PF
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
-                                       QWEN4_K_HC_GATE_MIX_Q8);
+                                       QWEN4_K_HC_GATE_MIX_Q8, QWEN4_K_HC_GATE_MIX_BF16);
     /* More independent output rows share the activated inputs in MTP.
      * Keep the per-row lane mapping and reduction order unchanged. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
@@ -48921,15 +48946,17 @@ int ds4_gpu_qwen4_conv_stream_rows2_tensor(
 
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps) {
-    struct { uint32_t n_tokens, n_head, head_dim; float eps; } args = { n_tokens, n_head, head_dim, eps };
+    struct { uint32_t n_tokens, n_head, head_dim, weight_type; float eps; } args =
+        { n_tokens, n_head, head_dim, weight_type, eps };
     qwen4_bind b[3];
     const uint64_t bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    if (n_tokens == 0 || head_dim < 32 || (head_dim % 32) != 0 ||
+    const uint64_t wbytes = qwen4_vec_bytes(weight_type, head_dim);
+    if (n_tokens == 0 || head_dim < 32 || (head_dim % 32) != 0 || wbytes == 0 ||
         !qwen4_bind_tensor(&b[0], o, bytes, "gdn out") ||
         !qwen4_bind_tensor(&b[1], z, bytes, "gdn gate") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset, (uint64_t)head_dim * sizeof(float),
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset, wbytes,
                            "ssm_norm")) {
         return 0;
     }
@@ -48942,17 +48969,18 @@ int ds4_gpu_qwen4_ple_gate_tensor(
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
         const void *model_map, uint64_t model_size,
         uint64_t g_key_offset, uint64_t g_query_offset, uint64_t g_conv_offset,
-        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps) {
+        uint32_t norm_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
-    struct { uint32_t n_tokens, n_embd, n_hc; float eps; } args = { n_tokens, n_embd, n_hc, eps };
+    const uint64_t gbytes = qwen4_vec_bytes(norm_type, dim);
+    struct { uint32_t n_tokens, n_embd, n_hc, norm_type; float eps; } args = { n_tokens, n_embd, n_hc, norm_type, eps };
     qwen4_bind b[8];
-    if (n_tokens == 0 ||
+    if (n_tokens == 0 || gbytes == 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "ple residual") ||
         !qwen4_bind_tensor(&b[1], key, n_tokens * dim * sizeof(float), "ple key") ||
         !qwen4_bind_tensor(&b[2], value, (uint64_t)n_tokens * n_embd * sizeof(float), "ple value") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, g_key_offset, dim * sizeof(float), "ple norm_key") ||
-        !qwen4_bind_weight(&b[4], model_map, model_size, g_query_offset, dim * sizeof(float), "ple norm_query") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, g_conv_offset, dim * sizeof(float), "ple norm_conv") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_key_offset, gbytes, "ple norm_key") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, g_query_offset, gbytes, "ple norm_query") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_conv_offset, gbytes, "ple norm_conv") ||
         !qwen4_bind_tensor(&b[6], gated, n_tokens * dim * sizeof(float), "ple gated") ||
         !qwen4_bind_tensor(&b[7], normed, n_tokens * dim * sizeof(float), "ple normed")) {
         return 0;
@@ -48967,9 +48995,9 @@ int ds4_gpu_qwen4_ple_conv_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_channels, uint32_t conv_kernel, uint32_t dilation,
         ds4_gpu_tensor *snap_history, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_history, uint32_t snap2_tok) {
-    const uint32_t wsize = weight_type == 1u ? 2u : weight_type == 0u ? 4u : 0u;
-    struct { uint32_t n_tokens, n_channels, conv_kernel, dilation, weight_f16, snap_tok, snap2_tok, pad2; } args =
-        { n_tokens, n_channels, conv_kernel, dilation, weight_type == 1u ? 1u : 0u,
+    const uint32_t wsize = weight_type == 1u ? 2u : weight_type == 0u ? 4u : weight_type == 30u ? 2u : 0u;
+    struct { uint32_t n_tokens, n_channels, conv_kernel, dilation, weight_type, snap_tok, snap2_tok, pad2; } args =
+        { n_tokens, n_channels, conv_kernel, dilation, weight_type,
           snap_history ? snap_tok : UINT32_MAX, snap2_history ? snap2_tok : UINT32_MAX, 0 };
     if (wsize == 0) return 0;
     const uint64_t rows = (uint64_t)n_tokens * n_channels * sizeof(float);
@@ -49061,21 +49089,24 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t norm_type,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap,
         float rope_base, float eps) {
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t norm_type; float rope_mscale; float rope_freq[32];
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_tokens * n_idx_head * idx_dim * sizeof(float);
     const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    const uint64_t gq_bytes = qwen4_vec_bytes(norm_type, head_dim);
+    const uint64_t giq_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[15];
-    if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+    if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 || gq_bytes == 0 || giq_bytes == 0 ||
         idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
         n_rot > idx_dim || (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
         !qwen4_bind_tensor(&b[0], qg, 2u * q_bytes, "attn q/gate projection") ||
@@ -49083,11 +49114,11 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
         !qwen4_bind_tensor(&b[3], iq, iq_bytes, "indexer q projection") ||
         !qwen4_bind_tensor(&b[4], ik, (uint64_t)n_tokens * idx_dim * sizeof(float), "indexer k projection") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float),
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, gq_bytes,
                            "attn q_norm") ||
-        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float),
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, gq_bytes,
                            "attn k_norm") ||
-        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, (uint64_t)idx_dim * sizeof(float),
+        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, giq_bytes,
                            "indexer q_norm") ||
         !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn q") ||
         !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn gate") ||
@@ -49104,18 +49135,20 @@ int ds4_gpu_qwen4_attn_prep_tensor(
 
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
-        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset, uint32_t norm_type,
         uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot,
         float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t norm_type;
              float rope_mscale; float rope_freq[32]; } args =
-        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
+    const uint64_t gik_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[4];
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        gik_bytes == 0 ||
         !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
+        !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, gik_bytes,
                            "indexer k_norm") ||
         !qwen4_bind_tensor(&b[2], pos3, n_keys * 16u, "rope positions") ||
         !qwen4_bind_tensor(&b[3], block_key, ((uint64_t)block0 + n_blocks) * idx_dim * 2u, "block keys")) {
@@ -49363,21 +49396,25 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t norm_type,
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t n_idx_head, uint32_t idx_dim, float rope_base, float eps) {
     /* The caller checks each row's position against its own cache; the
      * kernel does not read cache_cap. */
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t norm_type; float rope_mscale; float rope_freq[32];
     } args = { n_rows, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, 0u, 0u,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_rows * n_idx_head * idx_dim * sizeof(float);
+    const uint64_t gq_bytes = qwen4_vec_bytes(norm_type, head_dim);
+    const uint64_t giq_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[12], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+        gq_bytes == 0 || giq_bytes == 0 ||
         idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
         n_rot > idx_dim || n_head_kv == 0 || (n_head % n_head_kv) != 0) {
         return 0;
@@ -49387,9 +49424,9 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn rows v projection") ||
         !qwen4_bind_tensor(&b[3], iq, iq_bytes, "indexer rows q projection") ||
         !qwen4_bind_tensor(&b[4], ik, (uint64_t)n_rows * idx_dim * sizeof(float), "indexer rows k projection") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float), "attn q_norm") ||
-        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float), "attn k_norm") ||
-        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, (uint64_t)idx_dim * sizeof(float), "indexer q_norm") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, gq_bytes, "attn q_norm") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, gq_bytes, "attn k_norm") ||
+        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, giq_bytes, "indexer q_norm") ||
         !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn rows q") ||
         !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn rows gate") ||
         !qwen4_bind_tensor(&b[10], iq_out, iq_bytes, "indexer rows q") ||
@@ -49403,16 +49440,17 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
 
 int ds4_gpu_qwen4_idx_block_key_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
-        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset, uint32_t norm_type,
         uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t norm_type;
              float rope_mscale; float rope_freq[32]; } args =
-        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
+    const uint64_t gik_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||
-        (idx_dim % 32) != 0 || n_rot > idx_dim ||
-        !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float), "indexer k_norm") ||
+        (idx_dim % 32) != 0 || n_rot > idx_dim || gik_bytes == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, gik_bytes, "indexer k_norm") ||
         !qwen4_bind_rows(&b[1], table, entry0, n_rows)) {
         return 0;
     }
@@ -50089,14 +50127,16 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
-        uint32_t n_embd, uint32_t n_hc, float eps) {
-    struct { uint32_t n_embd, n_hc, pad0; float eps; } args = { n_embd, n_hc, 0u, eps };
+        uint32_t norm_type, uint32_t n_embd, uint32_t n_hc, float eps) {
+    struct { uint32_t n_embd, n_hc, norm_type; float eps; } args = { n_embd, n_hc, norm_type, eps };
+    const uint64_t ge_bytes = qwen4_vec_bytes(norm_type, n_embd);
+    const uint64_t gh_bytes = qwen4_vec_bytes(norm_type, (uint64_t)n_embd * n_hc);
     qwen4_bind b[5];
-    if (n_embd == 0 || n_hc == 0 ||
+    if (n_embd == 0 || n_hc == 0 || ge_bytes == 0 || gh_bytes == 0 ||
         !qwen4_bind_tensor(&b[0], e, (uint64_t)n_embd * sizeof(float), "mtp embedding") ||
         !qwen4_bind_tensor(&b[1], R, (uint64_t)n_embd * n_hc * sizeof(float), "mtp streams") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, (uint64_t)n_embd * sizeof(float), "mtp enorm") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, (uint64_t)n_embd * n_hc * sizeof(float),
+        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, ge_bytes, "mtp enorm") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, gh_bytes,
                            "mtp hnorm") ||
         !qwen4_bind_tensor(&b[4], cat, (uint64_t)(n_hc + 1u) * 2u * n_embd * sizeof(float), "mtp concat")) {
         return 0;
@@ -50241,12 +50281,13 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
+    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : (weight_type == 1u || weight_type == 30u) ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
     struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
         { n_tokens, in_dim, out_rows, weight_type, row_bytes, 1, 0, 0 };
     qwen4_bind b[3];
-    if (n_tokens == 0 || row_bytes == 0 || (weight_type != 0u && weight_type != 1u && weight_type != 8u) ||
+    if (n_tokens == 0 || row_bytes == 0 ||
+        (weight_type != 0u && weight_type != 1u && weight_type != 8u && weight_type != 30u) ||
         (weight_type == 8u && (in_dim % 32) != 0) || (in_dim % 8) != 0 || out_rows == 0) {
         fprintf(stderr, "ds4: Qwen3.8 dense mm rejected type %u in %u out %u tokens %u\n",
                 weight_type, in_dim, out_rows, n_tokens);

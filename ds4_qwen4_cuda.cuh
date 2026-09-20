@@ -1817,8 +1817,9 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 
 extern "C" int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *z,
-        const void *map, uint64_t size, uint64_t off, uint32_t T, uint32_t H, uint32_t D, float eps) {
+        const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t H, uint32_t D, float eps) {
     using namespace qwen4_cuda;
+    (void)type;   /* CUDA keeps F32 norm weights; BF16 spine is Metal-only */
     const uint64_t n = (uint64_t)T * H * D;
     if (!n || D < 32 || D > 128 || D % 32 || !tensor(out, n * 4) || !tensor(z, n * 4)) return 0;
     const char *w = weight(map, size, off, (uint64_t)D * 4);
@@ -1830,8 +1831,9 @@ extern "C" int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *out, const ds4_gpu_t
 extern "C" int ds4_gpu_qwen4_ple_gate_tensor(ds4_gpu_tensor *gated, ds4_gpu_tensor *normed,
         const ds4_gpu_tensor *R, const ds4_gpu_tensor *key, const ds4_gpu_tensor *val,
         const void *map, uint64_t size, uint64_t ko, uint64_t qo, uint64_t co,
-        uint32_t T, uint32_t E, uint32_t hc, float eps) {
+        uint32_t norm_type, uint32_t T, uint32_t E, uint32_t hc, float eps) {
     using namespace qwen4_cuda;
+    (void)norm_type;
     const uint64_t bytes = (uint64_t)T * E * hc * 4, wb = (uint64_t)E * hc * 4;
     if (!T || !E || !hc || hc > 4 || !tensor(gated, bytes) || !tensor(normed, bytes) ||
         !tensor(R, bytes) || !tensor(key, bytes) || !tensor(val, (uint64_t)T * E * 4)) return 0;
@@ -1862,8 +1864,9 @@ extern "C" int ds4_gpu_qwen4_ple_conv_tensor(ds4_gpu_tensor *R, const ds4_gpu_te
 
 extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *inj,
         const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t go, uint64_t io,
-        uint32_t type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
+        uint32_t type, uint32_t gamma_type, uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
     using namespace qwen4_cuda;
+    (void)gamma_type;
     const uint64_t n = (uint64_t)T * E * hc;
     if (!T || !E || !hc || hc > 8 || ni > 4 ||
         !tensor(xn, n * 4) || !tensor(R, n * 4) ||
@@ -1943,9 +1946,10 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
         const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
         const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
-        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
+        uint32_t norm_type, uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
         uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps) {
     using namespace qwen4_cuda;
+    (void)norm_type;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
     if (!T || !H || !Hkv || H % Hkv || !Hi || D < 32 || D > 256 || D % 32 ||
         Di < 32 || Di > 128 || Di % 32 || nrot > 64 || nrot > D || nrot > Di || nrot % 2 ||
@@ -1966,9 +1970,10 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
 
 extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *map, uint64_t size,
-        uint64_t off, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
+        uint64_t off, uint32_t norm_type, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
         float base, float eps) {
     using namespace qwen4_cuda;
+    (void)norm_type;
     const uint64_t rows = (uint64_t)b0 + N;
     if (!N || !ratio || D < 32 || D > 128 || D % 32 || nrot > D || nrot > 64 || nrot % 2 ||
         !tensor(out, rows * D * 2) || !tensor(ik, rows * ratio * D * 4) || !tensor(pos3, rows * ratio * 16)) return 0;
@@ -2192,20 +2197,21 @@ extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
 
 extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
         const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,
-        const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type,
+        const void *map, uint64_t size, uint64_t go, uint64_t io, uint32_t type, uint32_t gamma_type,
         uint32_t T, uint32_t E, uint32_t hc, uint32_t ni, float eps) {
     const uint64_t bytes = (uint64_t)T*E*hc*4;
     if (!qwen4_cuda::tensor(next,bytes) || !qwen4_cuda::tensor(R,bytes) || next->ptr == R->ptr ||
         !inj || !oldinj || inj->ptr == oldinj->ptr) return 0;
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,cuda_decode_stream()),"Qwen HC copy")) return 0;
     return ds4_gpu_qwen4_hc_combine_tensor(next,blk,oldinj,T,E,hc) &&
-           ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps);
+           ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,gamma_type,T,E,hc,ni,eps);
 }
 
 extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu_tensor *e,
         const ds4_gpu_tensor *R, const void *map, uint64_t size, uint64_t eo, uint64_t ho,
-        uint32_t E, uint32_t hc, float eps) {
+        uint32_t norm_type, uint32_t E, uint32_t hc, float eps) {
     using namespace qwen4_cuda;
+    (void)norm_type;
     if (!E || !hc || hc > 4 || !tensor(cat,(uint64_t)(hc+1)*2*E*4) ||
         !tensor(e,(uint64_t)E*4) || !tensor(R,(uint64_t)hc*E*4)) return 0;
     const char *ge = weight(map,size,eo,(uint64_t)E*4), *gh = weight(map,size,ho,(uint64_t)hc*E*4);

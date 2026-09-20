@@ -41,11 +41,13 @@ import time
 import numpy as np
 
 GGUF_MAGIC = b"GGUF"
-T_F32, T_F16, T_Q4_0, T_Q4_1, T_Q8_0, T_BF16, T_I64, T_Q4_K, T_MXFP4 = 0, 1, 2, 3, 8, 30, 27, 12, 39
+T_F32, T_F16, T_Q4_0, T_Q4_1, T_Q8_0, T_Q2_K, T_BF16, T_IQ2_XXS, T_I64, T_Q4_K, T_MXFP4 = \
+    0, 1, 2, 3, 8, 10, 30, 16, 27, 12, 39
 TYPE_BYTES = {T_F32: 4, T_F16: 2, T_Q4_0: 18, T_Q4_1: 20, T_Q8_0: 34, T_BF16: 2, T_I64: 8,
-              T_Q4_K: 144, T_MXFP4: 17}
+              T_Q4_K: 144, T_MXFP4: 17, T_Q2_K: 84, T_IQ2_XXS: 66}
 # quantized types store block_bytes per block_elems values, not per element
-BLOCK_ELEMS = {T_Q4_0: 32, T_Q4_1: 32, T_Q8_0: 32, T_Q4_K: 256, T_MXFP4: 32}
+BLOCK_ELEMS = {T_Q4_0: 32, T_Q4_1: 32, T_Q8_0: 32, T_Q4_K: 256, T_MXFP4: 32,
+               T_Q2_K: 256, T_IQ2_XXS: 256}
 
 
 def tnbytes(t: int, n: int) -> int:
@@ -428,6 +430,153 @@ def prod_flat_f32(base_name):
     return p
 
 
+# --------------------------------------------------------------------------
+# BF16-spine producers (q2bf16 fast-pack -> qwen4exp with a BF16 spine)
+#
+# The Q4 recipe converts the BF16 control tensors to F32/F16 and permutes the
+# Q8_0 dense projections at their quant-block granularity.  The q2bf16 pack
+# stores the whole spine as BF16, so the same numeric transforms are applied
+# in F32 and the result is rounded back to BF16.  Pure row/column permutations
+# are byte copies because every permutation boundary is 128-wide (4 blocks of
+# 32 values in the Q8_0 layout), so no re-quantization is involved.
+
+
+def f32_to_bf16_bytes(a: np.ndarray) -> bytes:
+    """Round F32 values to BF16 with round-to-nearest-even."""
+    u = np.ascontiguousarray(a, dtype=np.float32).view("<u4").astype(np.uint32)
+    r = (u + np.uint32(0x7fff) + ((u >> 16) & np.uint32(1))) & np.uint32(0xffff0000)
+    return (r >> np.uint32(16)).astype("<u2").tobytes()
+
+
+def prod_bf16_scale(base_name, scale):
+    """BF16 -> BF16 with a numeric scale (the HC divisor fold)."""
+    def p(b, ple, out):
+        t, dims, nbytes = b.seek_tensor(base_name)
+        left = nbytes
+        while left:
+            n = min(CHUNK, left) & ~1
+            u = np.frombuffer(b.f.read(n), dtype="<u2").astype(np.uint32) << 16
+            v = u.view("<f4") * np.float32(scale)
+            out.write(f32_to_bf16_bytes(v))
+            left -= n
+        return nbytes
+    return p
+
+
+def prod_permute_rows_bf16(base_name, rows):
+    """BF16 [row_length, rows] -> BF16 with output row j = pack row TILED_ORDER[j]."""
+    def p(b, ple, out):
+        t, dims, off = b.tensors[base_name]
+        n = 1
+        for d in dims:
+            n *= d
+        nbytes = tnbytes(t, n)
+        rowbytes = nbytes // rows
+        for j in range(rows):
+            b.f.seek(b.data_start + off + TILED_ORDER[j] * rowbytes)
+            out.write(b.f.read(rowbytes))
+        return nbytes
+    return p
+
+
+def prod_qkv_vperm_bf16(base_name):
+    """BF16 [2560, 10240] with the v-region rows (4096..10239) permuted per
+    128-row head: output head slot q holds pack head TILED_ORDER[q]."""
+    ROWB = 2560 * 2
+    def p(b, ple, out):
+        t, dims, off = b.tensors[base_name]
+        b.f.seek(b.data_start + off)
+        out.write(b.f.read(4096 * ROWB))
+        heads = b.f.read(6144 * ROWB)
+        for q in range(48):
+            src = TILED_ORDER[q]
+            out.write(heads[src * 128 * ROWB:(src + 1) * 128 * ROWB])
+        return 10240 * ROWB
+    return p
+
+
+def prod_gate_rowperm_bf16(base_name):
+    """BF16 [2560, 6144]: 48 heads of 128 rows, output slot q holds pack head
+    TILED_ORDER[q]."""
+    ROWB = 2560 * 2
+    def p(b, ple, out):
+        t, dims, off = b.tensors[base_name]
+        b.f.seek(b.data_start + off)
+        blob = b.f.read(6144 * ROWB)
+        for q in range(48):
+            src = TILED_ORDER[q]
+            out.write(blob[src * 128 * ROWB:(src + 1) * 128 * ROWB])
+        return 6144 * ROWB
+    return p
+
+
+def prod_out_colperm_bf16(base_name):
+    """BF16 [6144, 2560]: rows of 6144 input values; the 48 head blocks of 128
+    values are reordered so output slot q holds pack head TILED_ORDER[q]."""
+    ROWB = 6144 * 2
+    CH = 128 * 2
+    def p(b, ple, out):
+        t, dims, off = b.tensors[base_name]
+        b.f.seek(b.data_start + off)
+        for r in range(2560):
+            row = b.f.read(ROWB)
+            for q in range(48):
+                src = TILED_ORDER[q]
+                out.write(row[src * CH:(src + 1) * CH])
+        return 2560 * ROWB
+    return p
+
+
+def prod_ssm_a_bf16(base_name):
+    def p(b, ple, out):
+        v = b.read_scalar_tensor(base_name, "A_log")
+        assert len(v) == N_K_HEAD * N_V_PER_K
+        a = -np.exp(v[TILED_ORDER])
+        out.write(f32_to_bf16_bytes(a))
+        return len(a) * 2
+    return p
+
+
+def prod_gdn_conv1d_bf16(base_name):
+    """GDN conv taps [1,4,10240] BF16 -> BF16 [4,10240] with the v-region
+    channels (4096..10240) permuted per 128-wide head by the tiled v order."""
+    def p(b, ple, out):
+        t, dims, nbytes = b.seek_tensor(base_name)
+        assert t == T_BF16 and nbytes == 4 * 10240 * 2, (base_name, t, nbytes)
+        v = np.frombuffer(b.f.read(nbytes), dtype="<u2").copy()
+        out_v = v.copy()
+        for w in range(10240):
+            if w < 4096:
+                continue
+            j = (w - 4096) // 128
+            src = 4096 + TILED_ORDER[j] * 128 + ((w - 4096) % 128)
+            out_v[w * 4:w * 4 + 4] = v[src * 4:src * 4 + 4]
+        out.write(out_v.tobytes())
+        return nbytes
+    return p
+
+
+def prod_eh_proj_bf16(src):
+    """MTP eh_proj from BF16 fc_embedding/fc_hidden: output row j concatenates
+    the fc_embedding row j (first 2560 inputs) with the fc_hidden row j."""
+    def p(b, ple, out):
+        def rd(name):
+            t, dims, off = src.tensors[name]
+            assert t == T_BF16 and dims == [2560, 2560], (name, t, dims)
+            src.f.seek(src.data_start + off)
+            return src.f.read(2560 * 2560 * 2)
+        e = rd("language_model.mtp.fc_embedding.weight")
+        h = rd("language_model.mtp.fc_hidden.weight")
+        row = 2560 * 2
+        buf = bytearray()
+        for j in range(2560):
+            buf += e[j * row:(j + 1) * row]
+            buf += h[j * row:(j + 1) * row]
+        out.write(bytes(buf))
+        return len(buf)
+    return p
+
+
 def from_src(src, prod):
     """Bind a producer to read from `src` (e.g. the MTP sidecar) instead of
     the base pack; every producer only touches its first Reader argument."""
@@ -586,6 +735,152 @@ def build_plan(base=None, mtp=None):
         add(C + "nextn.hc_head_norm.weight", T_F32, [10240], m(prod_bf16_f32("language_model.mtp.hyper_connection_mixer.hc_norm.weight")))
         add(C + "nextn.hc_head_down.weight", T_F16, [10240, 320], m(prod_hc_mix_f32("language_model.mtp.hyper_connection_mixer.input_mix_weight_down.weight")))
         add(C + "nextn.hc_head_up.weight", T_F16, [320, 10240], m(prod_bf16_f16("language_model.mtp.hyper_connection_mixer.input_mix_weight_up.weight")))
+    return plan
+
+
+def build_plan_bf16(base=None, mtp=None, gdn_bf16=False):
+    """qwen4exp plan for the BF16-spine / Q2 routed-expert fast-pack.
+
+    Tensor names and shapes match build_plan() exactly; only the spine storage
+    types differ (BF16 instead of F32/F16/Q8_0).  The routed experts are copied
+    unchanged: IQ2_XXS gate/up and Q2_K down with the 768-wide physical pad.
+
+    ssm_a / ssm_dt.bias / ssm_conv1d default to F32 even though the pack stores
+    them BF16, because ds4's GDN kernels still require F32 there (Workstream B
+    left them untouched).  gdn_bf16=True emits BF16 for them instead, which is
+    only loadable once those kernels accept BF16.
+    """
+    plan = []
+
+    def add(out_name, out_type, dims, producer):
+        plan.append((out_name, out_type, dims, producer))
+
+    probe = base if base is not None else mtp
+    gate_t = probe.tensors.get(
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight", (None,))[0]
+    down_t = probe.tensors.get(
+        "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight", (None,))[0]
+    if gate_t is None:
+        gate_t = probe.tensors["language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight"][0]
+        down_t = probe.tensors["language_model.mtp.layers.0.mlp.switch_mlp.down_proj.weight"][0]
+    if gate_t != T_IQ2_XXS or down_t != T_Q2_K:
+        raise SystemExit("spine-bf16 plan expects IQ2_XXS gate/up and Q2_K down, "
+                         f"got gate/up={gate_t} down={down_t}")
+    print("spine-bf16 plan: gate/up=IQ2_XXS down=Q2_K (768 physical), spine=BF16"
+          + (" (GDN control BF16)" if gdn_bf16 else " (GDN control F32)"))
+
+    gdn_vec_t = T_BF16 if gdn_bf16 else T_F32
+    dt_prod = (lambda name: prod_permute_rows_bf16(name, 48)) if gdn_bf16 \
+        else (lambda name: prod_permute_rows_f32(name, 48))
+    a_prod = prod_ssm_a_bf16 if gdn_bf16 else prod_ssm_a
+    conv_prod = prod_gdn_conv1d_bf16 if gdn_bf16 else prod_gdn_conv1d_f32
+
+    add("token_embd.weight", T_BF16, [2560, 248320],
+        prod_copy("language_model.model.embed_tokens.weight"))
+    add("output.weight", T_BF16, [2560, 248320],
+        prod_copy("language_model.lm_head.weight"))
+    add("output_hc_norm.weight", T_BF16, [10240],
+        prod_copy("language_model.model.hyper_connection_mixer.hc_norm.weight"))
+    add("output_hc_down.weight", T_BF16, [10240, 320],
+        prod_bf16_scale("language_model.model.hyper_connection_mixer.input_mix_weight_down.weight",
+                        N_HC_DIVISOR))
+    add("output_hc_up.weight", T_BF16, [320, 10240],
+        prod_copy("language_model.model.hyper_connection_mixer.input_mix_weight_up.weight"))
+
+    for n in range(N_LAYER):
+        P = f"language_model.model.layers.{n}."
+        B = f"blk.{n}."
+        add(B + "hc_attn_norm.weight", T_BF16, [10240], prod_copy(P + "attn_hyper_connection.hc_norm.weight"))
+        add(B + "hc_attn_down.weight", T_BF16, [10240, 320],
+            prod_bf16_scale(P + "attn_hyper_connection.input_mix_weight_down.weight", N_HC_DIVISOR))
+        add(B + "hc_attn_up.weight", T_BF16, [320, 10240], prod_copy(P + "attn_hyper_connection.input_mix_weight_up.weight"))
+        add(B + "hc_attn_inject.weight", T_BF16, [10240, 4],
+            prod_bf16_scale(P + "attn_hyper_connection.block_inject_weight.weight", N_HC_DIVISOR))
+        add(B + "hc_ffn_norm.weight", T_BF16, [10240], prod_copy(P + "mlp_hyper_connection.hc_norm.weight"))
+        add(B + "hc_ffn_down.weight", T_BF16, [10240, 320],
+            prod_bf16_scale(P + "mlp_hyper_connection.input_mix_weight_down.weight", N_HC_DIVISOR))
+        add(B + "hc_ffn_up.weight", T_BF16, [320, 10240], prod_copy(P + "mlp_hyper_connection.input_mix_weight_up.weight"))
+        add(B + "hc_ffn_inject.weight", T_BF16, [10240, 4],
+            prod_bf16_scale(P + "mlp_hyper_connection.block_inject_weight.weight", N_HC_DIVISOR))
+        if (n + 1) % 4 != 0:  # GDN trunk tensors exist only on linear layers
+            add(B + "attn_qkv.weight", T_BF16, [2560, 10240], prod_qkv_vperm_bf16(P + "linear_attn.in_proj_qkv.weight"))
+            add(B + "attn_gate.weight", T_BF16, [2560, 6144], prod_gate_rowperm_bf16(P + "linear_attn.in_proj_z.weight"))
+            add(B + "ssm_out.weight", T_BF16, [6144, 2560], prod_out_colperm_bf16(P + "linear_attn.out_proj.weight"))
+            add(B + "ssm_alpha.weight", T_BF16, [2560, 48], prod_permute_rows_bf16(P + "linear_attn.in_proj_a.weight", 48))
+            add(B + "ssm_beta.weight", T_BF16, [2560, 48], prod_permute_rows_bf16(P + "linear_attn.in_proj_b.weight", 48))
+            add(B + "ssm_a", gdn_vec_t, [48], a_prod(P + "linear_attn.A_log"))
+            add(B + "ssm_dt.bias", gdn_vec_t, [48], dt_prod(P + "linear_attn.dt_bias"))
+            add(B + "ssm_norm.weight", T_BF16, [128], prod_copy(P + "linear_attn.norm.weight"))
+            add(B + "ssm_conv1d.weight", gdn_vec_t, [4, 10240], conv_prod(P + "linear_attn.conv1d.weight"))
+        if (n + 1) % 4 == 0:  # full attention layers: 3, 7, ..., 47
+            add(B + "attn_q.weight", T_BF16, [2560, 12288], prod_copy(P + "self_attn.q_proj.weight"))
+            add(B + "attn_k.weight", T_BF16, [2560, 512], prod_copy(P + "self_attn.k_proj.weight"))
+            add(B + "attn_v.weight", T_BF16, [2560, 512], prod_copy(P + "self_attn.v_proj.weight"))
+            add(B + "attn_output.weight", T_BF16, [6144, 2560], prod_copy(P + "self_attn.o_proj.weight"))
+            add(B + "attn_q_norm.weight", T_BF16, [256], prod_copy(P + "self_attn.q_norm.weight"))
+            add(B + "attn_k_norm.weight", T_BF16, [256], prod_copy(P + "self_attn.k_norm.weight"))
+            add(B + "indexer.q_proj.weight", T_BF16, [2560, 512],
+                _prod_indexer_part(P + "self_attn.indexer.index_qk_proj.weight", 0, 512))
+            add(B + "indexer.k_proj.weight", T_BF16, [2560, 128],
+                _prod_indexer_part(P + "self_attn.indexer.index_qk_proj.weight", 512, 128))
+            add(B + "indexer.q_norm.weight", T_BF16, [128], prod_copy(P + "self_attn.indexer.q_layernorm.weight"))
+            add(B + "indexer.k_norm.weight", T_BF16, [128], prod_copy(P + "self_attn.indexer.k_layernorm.weight"))
+        if n == 1:  # PLE projections live on HF layer 1
+            add(B + "ple_key.weight", T_BF16, [2560, 10240], prod_copy(P + "ple.key_proj.weight"))
+            add(B + "ple_value.weight", T_BF16, [2560, 2560], prod_copy(P + "ple.value_proj.weight"))
+            add(B + "ple_norm_key.weight", T_BF16, [10240], prod_copy(P + "ple.norm_key.weight"))
+            add(B + "ple_norm_query.weight", T_BF16, [10240], prod_copy(P + "ple.norm_query.weight"))
+            add(B + "ple_norm_conv.weight", T_BF16, [10240], prod_copy(P + "ple.norm_conv.weight"))
+            add(B + "ple_conv1d.weight", T_BF16, [4, 10240], prod_copy(P + "ple.conv1d.weight"))
+        add(B + "ffn_gate_inp.weight", T_BF16, [2560, 512], prod_copy(P + "mlp.gate.weight"))
+        add(B + "ffn_gate_exps.weight", gate_t, [2560, 640, 512], prod_copy(P + "mlp.switch_mlp.gate_proj.weight"))
+        add(B + "ffn_up_exps.weight", gate_t, [2560, 640, 512], prod_copy(P + "mlp.switch_mlp.up_proj.weight"))
+        add(B + "ffn_down_exps.weight", down_t, [768, 2560, 512], prod_copy(P + "mlp.switch_mlp.down_proj.weight"))
+        add(B + "ffn_gate_shexp.weight", T_BF16, [2560, 640], prod_copy(P + "mlp.shared_expert.gate_proj.weight"))
+        add(B + "ffn_up_shexp.weight", T_BF16, [2560, 640], prod_copy(P + "mlp.shared_expert.up_proj.weight"))
+        add(B + "ffn_down_shexp.weight", T_BF16, [640, 2560], prod_copy(P + "mlp.shared_expert.down_proj.weight"))
+        add(B + "ffn_gate_inp_shexp.weight", T_BF16, [2560], prod_copy(P + "mlp.shared_expert_gate.weight"))
+
+    if mtp is not None:
+        M = "language_model.mtp.layers.0."
+        C = "blk.48."
+        def m(prod):
+            return from_src(mtp, prod)
+        add(C + "hc_attn_norm.weight", T_BF16, [10240], m(prod_copy(M + "attn_hyper_connection.hc_norm.weight")))
+        add(C + "hc_attn_down.weight", T_BF16, [10240, 320], m(prod_bf16_scale(M + "attn_hyper_connection.input_mix_weight_down.weight", N_HC_DIVISOR)))
+        add(C + "hc_attn_up.weight", T_BF16, [320, 10240], m(prod_copy(M + "attn_hyper_connection.input_mix_weight_up.weight")))
+        add(C + "hc_attn_inject.weight", T_BF16, [10240, 4], m(prod_bf16_scale(M + "attn_hyper_connection.block_inject_weight.weight", N_HC_DIVISOR)))
+        add(C + "hc_ffn_norm.weight", T_BF16, [10240], m(prod_copy(M + "mlp_hyper_connection.hc_norm.weight")))
+        add(C + "hc_ffn_down.weight", T_BF16, [10240, 320], m(prod_bf16_scale(M + "mlp_hyper_connection.input_mix_weight_down.weight", N_HC_DIVISOR)))
+        add(C + "hc_ffn_up.weight", T_BF16, [320, 10240], m(prod_copy(M + "mlp_hyper_connection.input_mix_weight_up.weight")))
+        add(C + "hc_ffn_inject.weight", T_BF16, [10240, 4], m(prod_bf16_scale(M + "mlp_hyper_connection.block_inject_weight.weight", N_HC_DIVISOR)))
+        # layer 48 is the nextn block: the engine treats it as full attention
+        add(C + "attn_q.weight", T_BF16, [2560, 12288], m(prod_copy(M + "self_attn.q_proj.weight")))
+        add(C + "attn_k.weight", T_BF16, [2560, 512], m(prod_copy(M + "self_attn.k_proj.weight")))
+        add(C + "attn_v.weight", T_BF16, [2560, 512], m(prod_copy(M + "self_attn.v_proj.weight")))
+        add(C + "attn_output.weight", T_BF16, [6144, 2560], m(prod_copy(M + "self_attn.o_proj.weight")))
+        add(C + "attn_q_norm.weight", T_BF16, [256], m(prod_copy(M + "self_attn.q_norm.weight")))
+        add(C + "attn_k_norm.weight", T_BF16, [256], m(prod_copy(M + "self_attn.k_norm.weight")))
+        add(C + "indexer.q_proj.weight", T_BF16, [2560, 512],
+            m(_prod_indexer_part(M + "self_attn.indexer.index_qk_proj.weight", 0, 512)))
+        add(C + "indexer.k_proj.weight", T_BF16, [2560, 128],
+            m(_prod_indexer_part(M + "self_attn.indexer.index_qk_proj.weight", 512, 128)))
+        add(C + "indexer.q_norm.weight", T_BF16, [128], m(prod_copy(M + "self_attn.indexer.q_layernorm.weight")))
+        add(C + "indexer.k_norm.weight", T_BF16, [128], m(prod_copy(M + "self_attn.indexer.k_layernorm.weight")))
+        add(C + "ffn_gate_inp.weight", T_BF16, [2560, 512], m(prod_copy(M + "mlp.gate.weight")))
+        add(C + "ffn_gate_exps.weight", gate_t, [2560, 640, 512], m(prod_copy(M + "mlp.switch_mlp.gate_proj.weight")))
+        add(C + "ffn_up_exps.weight", gate_t, [2560, 640, 512], m(prod_copy(M + "mlp.switch_mlp.up_proj.weight")))
+        add(C + "ffn_down_exps.weight", down_t, [768, 2560, 512], m(prod_copy(M + "mlp.switch_mlp.down_proj.weight")))
+        add(C + "ffn_gate_shexp.weight", T_BF16, [2560, 640], m(prod_copy(M + "mlp.shared_expert.gate_proj.weight")))
+        add(C + "ffn_up_shexp.weight", T_BF16, [2560, 640], m(prod_copy(M + "mlp.shared_expert.up_proj.weight")))
+        add(C + "ffn_down_shexp.weight", T_BF16, [640, 2560], m(prod_copy(M + "mlp.shared_expert.down_proj.weight")))
+        add(C + "ffn_gate_inp_shexp.weight", T_BF16, [2560], m(prod_copy(M + "mlp.shared_expert_gate.weight")))
+        add(C + "nextn.eh_proj.weight", T_BF16, [5120, 2560], prod_eh_proj_bf16(mtp))
+        add(C + "nextn.enorm.weight", T_BF16, [2560], m(prod_copy("language_model.mtp.pre_fc_norm_embedding.weight")))
+        add(C + "nextn.hnorm.weight", T_BF16, [10240], m(prod_copy("language_model.mtp.pre_fc_norm_hidden.weight")))
+        add(C + "nextn.hc_head_norm.weight", T_BF16, [10240], m(prod_copy("language_model.mtp.hyper_connection_mixer.hc_norm.weight")))
+        add(C + "nextn.hc_head_down.weight", T_BF16, [10240, 320], m(prod_bf16_scale("language_model.mtp.hyper_connection_mixer.input_mix_weight_down.weight", N_HC_DIVISOR)))
+        add(C + "nextn.hc_head_up.weight", T_BF16, [320, 10240], m(prod_copy("language_model.mtp.hyper_connection_mixer.input_mix_weight_up.weight")))
     return plan
 
 
@@ -775,12 +1070,22 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--mtp", default=None,
                     help="MTP sidecar GGUF (qwen4-exp-mtp); adds the blk.48 nextn block")
+    ap.add_argument("--spine-bf16", action="store_true",
+                    help="emit the qwen4exp spine in BF16 (q2bf16 fast-pack input, "
+                         "IQ2_XXS gate/up, Q2_K down) instead of the Q4 recipe")
+    ap.add_argument("--gdn-bf16", action="store_true",
+                    help="with --spine-bf16, also store ssm_a/ssm_dt.bias/ssm_conv1d "
+                         "as BF16 (needs ds4 GDN kernel support; not loadable by the "
+                         "current runtime)")
     args = ap.parse_args()
 
     base = Reader(args.base)
     ple = Reader(args.ple)
     mtp = Reader(args.mtp) if args.mtp else None
-    plan = build_plan(base, mtp)
+    if args.spine_bf16:
+        plan = build_plan_bf16(base, mtp, gdn_bf16=args.gdn_bf16)
+    else:
+        plan = build_plan(base, mtp)
 
     # every pack tensor must be consumed exactly once
     srcs = []

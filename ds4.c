@@ -5491,6 +5491,22 @@ static void tensor_expect_qwen4_dense_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+/* 1-D spine vectors (RMSNorm gammas, biases and the shared-expert gate) may
+ * be stored F32, F16 or BF16; the graph kernels read all three by type. */
+static bool tensor_type_is_vec_f16_f32_bf16(uint32_t type) {
+    return type == DS4_TENSOR_F32 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_BF16;
+}
+
+static void tensor_expect_vec_layout(const ds4_tensor *t, uint64_t d0) {
+    if (!t) ds4_die("internal error: missing tensor while validating vector layout");
+    if (!tensor_type_is_vec_f16_f32_bf16(t->type)) {
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected F32, F16 or BF16\n",
+                (int)t->name.len, t->name.ptr, t->type);
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, 1, d0, 0, 0);
+}
+
 static void tensor_expect_qwen4_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
@@ -5550,7 +5566,7 @@ static void weights_validate_qwen4_layout(
     if (require_output && !have_output) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
     if (have_output) {
-        tensor_expect_layout(w->output_hc_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+        tensor_expect_vec_layout(w->output_hc_norm, hc_dim);
         tensor_expect_qwen4_dense_layout(w->output_hc_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
         tensor_expect_qwen4_dense_layout(w->output_hc_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
@@ -5562,11 +5578,11 @@ static void weights_validate_qwen4_layout(
             fprintf(stderr, "ds4: required Qwen tensors for layer %u are missing\n", il);
             exit(1);
         }
-        tensor_expect_layout(l->hc_attn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+        tensor_expect_vec_layout(l->hc_attn_norm, hc_dim);
         tensor_expect_qwen4_dense_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
         tensor_expect_qwen4_dense_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         tensor_expect_qwen4_dense_layout(l->hc_attn_inject, 2, hc_dim, DS4_N_HC, 0);
-        tensor_expect_layout(l->hc_ffn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+        tensor_expect_vec_layout(l->hc_ffn_norm, hc_dim);
         tensor_expect_qwen4_dense_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
         tensor_expect_qwen4_dense_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         tensor_expect_qwen4_dense_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
@@ -5579,30 +5595,34 @@ static void weights_validate_qwen4_layout(
             tensor_expect_layout(l->lin_a, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
             tensor_expect_qwen4_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
             tensor_expect_qwen4_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
-            tensor_expect_layout(l->lin_norm, DS4_TENSOR_F32, 1, DS4_N_LIN_HEAD_DIM, 0, 0);
+            tensor_expect_vec_layout(l->lin_norm, DS4_N_LIN_HEAD_DIM);
             tensor_expect_qwen4_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
         } else {
             tensor_expect_qwen4_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
             tensor_expect_qwen4_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
             tensor_expect_qwen4_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
             tensor_expect_qwen4_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
-            tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
-            tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_vec_layout(l->attn_q_norm, DS4_N_HEAD_DIM);
+            tensor_expect_vec_layout(l->attn_k_norm, DS4_N_HEAD_DIM);
             tensor_expect_qwen4_dense_layout(l->indexer_q_proj, 2, DS4_N_EMBD, index_q_dim, 0);
             tensor_expect_qwen4_dense_layout(l->indexer_k_proj, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
-            tensor_expect_layout(l->indexer_q_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
-            tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+            tensor_expect_vec_layout(l->indexer_q_norm, DS4_N_INDEXER_HEAD_DIM);
+            tensor_expect_vec_layout(l->indexer_k_norm, DS4_N_INDEXER_HEAD_DIM);
         }
         if (ds4_qwen4_layer_is_ple(il)) {
             tensor_expect_qwen4_dense_layout(l->ple_key, 2, DS4_N_EMBD, hc_dim, 0);
             tensor_expect_qwen4_dense_layout(l->ple_value, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-            tensor_expect_layout(l->ple_norm_key, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-            tensor_expect_layout(l->ple_norm_query, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-            tensor_expect_layout(l->ple_norm_conv, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-            tensor_expect_layout(l->ple_conv, l->ple_conv->type == DS4_TENSOR_F16 ? DS4_TENSOR_F16 : DS4_TENSOR_F32,
-                                 2, DS4_N_PLE_CONV, hc_dim, 0);
+            tensor_expect_vec_layout(l->ple_norm_key, hc_dim);
+            tensor_expect_vec_layout(l->ple_norm_query, hc_dim);
+            tensor_expect_vec_layout(l->ple_norm_conv, hc_dim);
+            if (!tensor_type_is_vec_f16_f32_bf16(l->ple_conv->type)) {
+                fprintf(stderr, "ds4: tensor %.*s has type %u, expected F32, F16 or BF16\n",
+                        (int)l->ple_conv->name.len, l->ple_conv->name.ptr, l->ple_conv->type);
+                exit(1);
+            }
+            tensor_expect_layout(l->ple_conv, l->ple_conv->type, 2, DS4_N_PLE_CONV, hc_dim, 0);
         }
-        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_qwen4_dense_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
@@ -5616,18 +5636,18 @@ static void weights_validate_qwen4_layout(
         }
         /* llama.cpp writes the shared-expert gate as a 1-D [n_embd] tensor */
         if (l->ffn_gate_inp_shexp->ndim == 1) {
-            tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_vec_layout(l->ffn_gate_inp_shexp, DS4_N_EMBD);
         } else {
-            tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 2, DS4_N_EMBD, 1, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_gate_inp_shexp, 2, DS4_N_EMBD, 1, 0);
         }
         tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (ds4_qwen4_layer_is_nextn(il)) {
             tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
-            tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
-            tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-            tensor_expect_layout(l->nextn_hc_head_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+            tensor_expect_vec_layout(l->nextn_enorm, DS4_N_EMBD);
+            tensor_expect_vec_layout(l->nextn_hnorm, hc_dim);
+            tensor_expect_vec_layout(l->nextn_hc_head_norm, hc_dim);
             tensor_expect_qwen4_dense_layout(l->nextn_hc_head_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
             tensor_expect_qwen4_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         }
@@ -57679,7 +57699,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const bool head_ok = l->nextn_hc_head_down && l->nextn_hc_head_up &&
             qwen4_graph_dense_ok(l->nextn_hc_head_down) &&
             (l->nextn_hc_head_up->type == DS4_TENSOR_F16 || l->nextn_hc_head_up->type == DS4_TENSOR_F32 ||
-             l->nextn_hc_head_up->type == DS4_TENSOR_Q8_0);
+             l->nextn_hc_head_up->type == DS4_TENSOR_BF16 || l->nextn_hc_head_up->type == DS4_TENSOR_Q8_0);
         if (!qwen4_graph_dense_ok(l->nextn_eh_proj) || !head_ok) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported nextn weight types\n");
             return false;
@@ -57689,13 +57709,15 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const ds4_layer_weights *l = &w->layer[il];
         const ds4_tensor *hc[4] = { l->hc_attn_up, l->hc_attn_inject, l->hc_ffn_up, l->hc_ffn_inject };
         for (int i = 0; i < 4; i++) {
-            if (hc[i]->type != DS4_TENSOR_F16 && hc[i]->type != DS4_TENSOR_F32 && hc[i]->type != DS4_TENSOR_Q8_0) {
-                fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 hc up/inject weights (layer %u)\n", il);
+            if (hc[i]->type != DS4_TENSOR_F16 && hc[i]->type != DS4_TENSOR_F32 &&
+                hc[i]->type != DS4_TENSOR_BF16 && hc[i]->type != DS4_TENSOR_Q8_0) {
+                fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/BF16/Q8_0 hc up/inject weights (layer %u)\n", il);
                 return false;
             }
         }
-        if (l->ple_conv && l->ple_conv->type != DS4_TENSOR_F32 && l->ple_conv->type != DS4_TENSOR_F16) {
-            fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F32/F16 PLE conv taps\n");
+        if (l->ple_conv && l->ple_conv->type != DS4_TENSOR_F32 && l->ple_conv->type != DS4_TENSOR_F16 &&
+            l->ple_conv->type != DS4_TENSOR_BF16) {
+            fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F32/F16/BF16 PLE conv taps\n");
             return false;
         }
         if (!qwen4_graph_dense_ok(l->hc_attn_down) || !qwen4_graph_dense_ok(l->hc_ffn_down)) {
@@ -58136,7 +58158,11 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
     const bool f16_batch = !legacy && n_tok > 3u && w->type == DS4_TENSOR_F16 &&
         n_tok <= 64u && (out_dim <= 512u || n_tok > 8u);
-    if (((n_tok > 8u && w->type == DS4_TENSOR_F32) || f16_batch) &&
+    /* BF16-spine dense projections: prefill-sized batches use the tiled
+     * GEMM (native bf16 weight reads); decode/verify keep the per-token
+     * multi-GEMV so the exact two/three-row rounding is preserved. */
+    const bool bf16_batch = !legacy && n_tok > 8u && w->type == DS4_TENSOR_BF16;
+    if (((n_tok > 8u && w->type == DS4_TENSOR_F32) || f16_batch || bf16_batch) &&
         (in_dim % 32) == 0) {
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->type, n_tok,
                                            (uint32_t)in_dim, (uint32_t)out_dim);
@@ -58287,6 +58313,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
     bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
+                                           norm->type,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g->lo, m, down, g->xn, T);
     if (T > 8u &&
@@ -58365,7 +58392,8 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
     if (ok) {
-        ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
+        ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset,
+                                          l->lin_norm->type, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
     }
     if (ok) ok = qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
@@ -58438,7 +58466,8 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
                                          g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
                                          m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
-                                         l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
+                                         l->indexer_q_norm->abs_offset, l->attn_q_norm->type,
+                                         T, DS4_N_HEAD, DS4_N_HEAD_KV,
                                          DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
                                          pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
         return false;
@@ -58448,7 +58477,7 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t n_blocks_after = (last + 1u) / ratio;
     if (n_blocks_after > first_block &&
         !ds4_gpu_qwen4_idx_block_key_tensor(g->layer_block_key[il], g->layer_ik_cache[il], g->pos3, m->map, m->size,
-                                            l->indexer_k_norm->abs_offset, first_block,
+                                            l->indexer_k_norm->abs_offset, l->indexer_k_norm->type, first_block,
                                             n_blocks_after - first_block, ratio, DS4_N_INDEXER_HEAD_DIM,
                                             DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) {
         return false;
@@ -58754,7 +58783,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                  ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
                                                m->map, m->size, l->ple_norm_key->abs_offset,
                                                l->ple_norm_query->abs_offset, l->ple_norm_conv->abs_offset,
-                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) &&
+                                               l->ple_norm_key->type, T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) &&
                  ds4_gpu_qwen4_ple_conv_tensor(g->R, g->ple_gated, g->ple_normed, g->ple_hist, m->map, m->size,
                                                l->ple_conv->abs_offset, l->ple_conv->type, T, hc_dim, DS4_N_PLE_CONV,
                                                DS4_N_PLE_NGRAM, g->snap_after_first ? g->snap_ple_hist : NULL, 0u,
@@ -58775,10 +58804,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
-            l->hc_ffn_inject->type == DS4_TENSOR_F16) {
+            (l->hc_ffn_inject->type == DS4_TENSOR_F16 || l->hc_ffn_inject->type == DS4_TENSOR_BF16)) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
                 g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
-                l->hc_ffn_inject->abs_offset, l->hc_ffn_inject->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS);
+                l->hc_ffn_inject->abs_offset, l->hc_ffn_inject->type, l->hc_ffn_norm->type,
+                T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS);
             if (ok) {
                 /* hc_u is unused by the single-token fused mixer. Both residual
                  * buffers have the same capacity, including for later prefill. */
@@ -59050,7 +59080,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         ok = e_row && R_row && cat_row &&
              ds4_gpu_qwen4_mtp_stage_tensor(cat_row, e_row, R_row, m->map, m->size,
                                              l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
-                                             E, hc, DS4_RMS_EPS);
+                                             l->nextn_enorm->type, E, hc, DS4_RMS_EPS);
         ds4_gpu_tensor_free(cat_row);
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
@@ -59142,7 +59172,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
         ok = e_row && R_row && cat_row &&
              ds4_gpu_qwen4_mtp_stage_tensor(cat_row, e_row, R_row, m->map, m->size,
                                              l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
-                                             E, hc, DS4_RMS_EPS);
+                                             l->nextn_enorm->type, E, hc, DS4_RMS_EPS);
         ds4_gpu_tensor_free(cat_row);
         ds4_gpu_tensor_free(R_row);
         ds4_gpu_tensor_free(e_row);
@@ -78529,7 +78559,7 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
         }
     }
     return ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size,
-                                        l->lin_norm->abs_offset, T, DS4_N_LIN_V_HEAD,
+                                        l->lin_norm->abs_offset, l->lin_norm->type, T, DS4_N_LIN_V_HEAD,
                                         DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
            qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
 }
@@ -78563,12 +78593,13 @@ static bool qwen4_batch_attention_entries(ds4_gpu_qwen4_attn_row *rows, uint32_t
               ds4_gpu_qwen4_attn_prep_rows_tensor(g->q, g->gate, g->iqn, g->qg, g->kp, g->vp, g->iq, g->ik,
                                                   g->batch_attn_rows, entry0, rows, n_rows, m->map, m->size,
                                                   l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
-                                                  l->indexer_q_norm->abs_offset, DS4_N_HEAD, DS4_N_HEAD_KV,
+                                                  l->indexer_q_norm->abs_offset, l->attn_q_norm->type,
+                                                  DS4_N_HEAD, DS4_N_HEAD_KV,
                                                   DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD,
                                                   DS4_N_INDEXER_HEAD_DIM, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
     if (ok && any_block) {
         ok = ds4_gpu_qwen4_idx_block_key_rows_tensor(g->batch_attn_rows, entry0, rows, n_rows, m->map, m->size,
-                                                     l->indexer_k_norm->abs_offset, ratio,
+                                                     l->indexer_k_norm->abs_offset, l->indexer_k_norm->type, ratio,
                                                      DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
                                                      DS4_RMS_EPS);
     }
@@ -78630,7 +78661,7 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                             r->qg, r->kp, r->vp, r->iq, r->ik, r->pos3,
                                             m->map, m->size, l->attn_q_norm->abs_offset,
                                             l->attn_k_norm->abs_offset,
-                                            l->indexer_q_norm->abs_offset, 1u, DS4_N_HEAD,
+                                            l->indexer_q_norm->abs_offset, l->attn_q_norm->type, 1u, DS4_N_HEAD,
                                             DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                             DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
                                             pos0, r->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
@@ -78639,7 +78670,7 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
         if (ok && n_blocks_after > first_block) {
             ok = ds4_gpu_qwen4_idx_block_key_tensor(r->layer_block_key[il], r->layer_ik_cache[il],
                                                     r->pos3, m->map, m->size,
-                                                    l->indexer_k_norm->abs_offset, first_block,
+                                                    l->indexer_k_norm->abs_offset, l->indexer_k_norm->type, first_block,
                                                     n_blocks_after - first_block, ratio,
                                                     DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
                                                     DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
@@ -78709,7 +78740,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
                                                l->ple_norm_key->abs_offset,
                                                l->ple_norm_query->abs_offset,
                                                l->ple_norm_conv->abs_offset,
-                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
+                                               l->ple_norm_key->type, T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
             /* the n-gram convolution carries per-session history */
             for (int i = 0; ok && i < count; i++) {
                 ok = ds4_gpu_qwen4_ple_conv_tensor(views[i].R, views[i].ple_gated,
@@ -78867,7 +78898,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                  ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
                                                m->map, m->size, l->ple_norm_key->abs_offset,
                                                l->ple_norm_query->abs_offset, l->ple_norm_conv->abs_offset,
-                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
+                                               l->ple_norm_key->type, T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
             for (int i = 0; ok && i < count; i++) {
                 ok = ds4_gpu_qwen4_ple_conv_tensor(views[i].R, views[i].ple_gated, views[i].ple_normed,
                                                    rowg[i].ple_hist, m->map, m->size, l->ple_conv->abs_offset,
@@ -78911,7 +78942,8 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                                                              grows, (uint32_t)count, T, DS4_N_LIN_K_HEAD,
                                                              DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV_DIM,
                                                              (uint32_t)v_dim) &&
-                         ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
+                         ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset,
+                                                      l->lin_norm->type, T,
                                                       DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
                          qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
         } else if (ok) {
@@ -79001,7 +79033,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         ds4_gpu_tensor *R = ds4_gpu_tensor_view(g->R, t * row_bytes, row_bytes);
         ds4_gpu_tensor *cat = ds4_gpu_tensor_view(g->part, t * cat_bytes, cat_bytes);
         ok = emb && R && cat && ds4_gpu_qwen4_mtp_stage_tensor(cat, emb, R, m->map, m->size,
-                l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset, E, hc, DS4_RMS_EPS);
+                l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset, l->nextn_enorm->type, E, hc, DS4_RMS_EPS);
         ds4_gpu_tensor_free(cat);
         ds4_gpu_tensor_free(R);
         ds4_gpu_tensor_free(emb);
