@@ -463,6 +463,30 @@ def prod_bf16_scale(base_name, scale):
     return p
 
 
+def prod_q8_0(base_name):
+    """BF16 -> Q8_0 (ggml block: one fp16 scale plus 32 int8 per 32 values).
+
+    Used to keep the shared-expert projections in Q8_0 while the rest of the
+    spine stays BF16."""
+    def p(b, ple, out):
+        t, dims, nbytes = b.seek_tensor(base_name)
+        raw = b.f.read(nbytes)
+        u = np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16
+        x = u.view("<f4").astype(np.float32)
+        blocks = x.reshape(-1, 32)
+        amax = np.abs(blocks).max(axis=1)
+        d = (amax / np.float32(127.0)).astype(np.float32)
+        inv = np.where(d > 0, np.float32(1.0) / np.where(d > 0, d, np.float32(1.0)),
+                       np.float32(0.0)).astype(np.float32)
+        q = np.rint(blocks * inv[:, None]).clip(-128.0, 127.0).astype(np.int8)
+        buf = np.zeros((blocks.shape[0], 34), dtype=np.uint8)
+        buf[:, :2] = d.astype("<f2").view(np.uint8).reshape(-1, 2)
+        buf[:, 2:] = q.view(np.uint8)
+        out.write(buf.tobytes())
+        return blocks.shape[0] * 34
+    return p
+
+
 def prod_permute_rows_bf16(base_name, rows):
     """BF16 [row_length, rows] -> BF16 with output row j = pack row TILED_ORDER[j]."""
     def p(b, ple, out):
@@ -738,7 +762,7 @@ def build_plan(base=None, mtp=None):
     return plan
 
 
-def build_plan_bf16(base=None, mtp=None, gdn_bf16=False):
+def build_plan_bf16(base=None, mtp=None, gdn_bf16=False, shared_q8=False):
     """qwen4exp plan for the BF16-spine / Q2 routed-expert fast-pack.
 
     Tensor names and shapes match build_plan() exactly; only the spine storage
@@ -836,9 +860,12 @@ def build_plan_bf16(base=None, mtp=None, gdn_bf16=False):
         add(B + "ffn_gate_exps.weight", gate_t, [2560, 640, 512], prod_copy(P + "mlp.switch_mlp.gate_proj.weight"))
         add(B + "ffn_up_exps.weight", gate_t, [2560, 640, 512], prod_copy(P + "mlp.switch_mlp.up_proj.weight"))
         add(B + "ffn_down_exps.weight", down_t, [768, 2560, 512], prod_copy(P + "mlp.switch_mlp.down_proj.weight"))
-        add(B + "ffn_gate_shexp.weight", T_BF16, [2560, 640], prod_copy(P + "mlp.shared_expert.gate_proj.weight"))
-        add(B + "ffn_up_shexp.weight", T_BF16, [2560, 640], prod_copy(P + "mlp.shared_expert.up_proj.weight"))
-        add(B + "ffn_down_shexp.weight", T_BF16, [640, 2560], prod_copy(P + "mlp.shared_expert.down_proj.weight"))
+        # Shared-expert projections: Q8_0 with --shared-q8, otherwise BF16.
+        shexp_t = T_Q8_0 if shared_q8 else T_BF16
+        shexp_prod = prod_q8_0 if shared_q8 else prod_copy
+        add(B + "ffn_gate_shexp.weight", shexp_t, [2560, 640], shexp_prod(P + "mlp.shared_expert.gate_proj.weight"))
+        add(B + "ffn_up_shexp.weight", shexp_t, [2560, 640], shexp_prod(P + "mlp.shared_expert.up_proj.weight"))
+        add(B + "ffn_down_shexp.weight", shexp_t, [640, 2560], shexp_prod(P + "mlp.shared_expert.down_proj.weight"))
         add(B + "ffn_gate_inp_shexp.weight", T_BF16, [2560], prod_copy(P + "mlp.shared_expert_gate.weight"))
 
     if mtp is not None:
@@ -1077,13 +1104,17 @@ def main():
                     help="with --spine-bf16, also store ssm_a/ssm_dt.bias/ssm_conv1d "
                          "as BF16 (needs ds4 GDN kernel support; not loadable by the "
                          "current runtime)")
+    ap.add_argument("--shared-q8", action="store_true",
+                    help="with --spine-bf16, store the shared-expert gate/up/down "
+                         "projections as Q8_0 instead of BF16")
     args = ap.parse_args()
 
     base = Reader(args.base)
     ple = Reader(args.ple)
     mtp = Reader(args.mtp) if args.mtp else None
     if args.spine_bf16:
-        plan = build_plan_bf16(base, mtp, gdn_bf16=args.gdn_bf16)
+        plan = build_plan_bf16(base, mtp, gdn_bf16=args.gdn_bf16,
+                               shared_q8=args.shared_q8)
     else:
         plan = build_plan(base, mtp)
 
