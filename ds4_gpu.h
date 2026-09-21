@@ -3416,6 +3416,15 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows);
+/* Metal-only measurement helper with no inference use: read `bytes` at
+ * `offset` of the mapped model at `threadgroups` threadgroups (0 = one 16 B
+ * vector per thread, covering the range once) and fold every word into a sink
+ * store that is never taken.  It times nothing itself; the kernel benches use
+ * it to read the machine's practical DRAM ceiling in the same run and machine
+ * state as the per-shape kernel rates they report. */
+int ds4_gpu_qwen4_stream_read_bench_tensor(
+        ds4_gpu_tensor *sink, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes, uint32_t threadgroups);
 /* softmax top-k router; with in_dim != 0 also the shared expert gate logit
  * (one row of gate_type at gate_offset dotted with x) into shared_gate [T] */
 int ds4_gpu_qwen4_router_topk_tensor(

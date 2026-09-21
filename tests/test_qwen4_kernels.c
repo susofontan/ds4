@@ -1093,12 +1093,44 @@ static void test_ple(arena_t *a, uint32_t E, uint32_t T) {
 
 /* ---- router ---- */
 
-static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
+/* logits whose probabilities are exactly tied.  A tie can only reach the
+ * ranking if the probabilities are bit-identical, and identical logits are the
+ * only way to guarantee that from the input side -- which is why the random
+ * logits below cannot exercise the tie-break at all.  The four patterns put a
+ * tie on every place the selection rule can be read from:
+ *   t%4 == 0  every expert tied            -> the whole top-k is the first k ids
+ *   t%4 == 1  a 6-way tie, then a 15-way one below it, so the k-th place falls
+ *             inside the second plateau    -> only the lowest ids of it survive
+ *   t%4 == 2  a 12-way tie spanning the k -> the cut is decided inside a tie
+ *   t%4 == 3  distinct leaders, then a plateau immediately below them */
+static float *tie_logits(uint32_t NE, uint32_t T) {
+    float *lg = malloc((uint64_t)T * NE * sizeof(float));
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t e = 0; e < NE; e++) {
+            float v;
+            switch (t % 4u) {
+            case 0:  v = 2.0f; break;
+            case 1:  v = e < 6u ? 9.0f : (e < 21u ? 5.0f : 0.0f); break;
+            case 2:  v = e < 12u ? 7.0f : 1.0f; break;
+            default: v = e < 3u ? (10.0f - (float)e) : (e < 30u ? 5.0f : 0.0f); break;
+            }
+            lg[(uint64_t)t * NE + e] = v;
+        }
+    }
+    return lg;
+}
+
+/* `logits_in` NULL picks random logits; otherwise the caller owns the array
+ * and `tag` names the case.  The reference ranks by probability descending and
+ * resolves a tie to the *lower* expert index, so a merge that broke ties the
+ * other way fails on the id, not on the weight tolerance. */
+static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T,
+                        const float *logits_in, const char *tag) {
     const uint32_t E = 2560;
     double *gate_w;
     const uint64_t gate_off = arena_f32(a, E, &gate_w, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * E, 1.0f);
-    float *logits = rand_vec((uint64_t)T * NE, 3.0f);
+    float *logits = logits_in ? (float *)logits_in : rand_vec((uint64_t)T * NE, 3.0f);
     ds4_gpu_tensor *gl = upload(logits, (uint64_t)T * NE);
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
@@ -1113,7 +1145,7 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
             for (uint32_t i = 0; i < E; i++) acc += gate_w[i] * x[(uint64_t)t * E + i];
             ref[t] = acc;
         }
-        snprintf(name, sizeof(name), "router NE=%u k=%u T=%u: shared gate logit", NE, k, T);
+        snprintf(name, sizeof(name), "router%s NE=%u k=%u T=%u: shared gate logit", tag, NE, k, T);
         check_tensor(name, gsg, ref, T, 1e-5);
         free(ref);
     }
@@ -1142,7 +1174,7 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
         }
         for (uint32_t i = 0; i < k; i++) {
             if (sel[t * k + i] != ref[i]) {
-                fprintf(stderr, "router: token %u slot %u expert %d != %d\n", t, i, sel[t * k + i], ref[i]);
+                fprintf(stderr, "router%s: token %u slot %u expert %d != %d\n", tag, t, i, sel[t * k + i], ref[i]);
                 exit(1);
             }
             const double d = fabs(w[t * k + i] - p[ref[i]] / wsum);
@@ -1150,10 +1182,26 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
         }
         free(ref); free(p);
     }
-    if (worst > 1e-6) { fprintf(stderr, "router weights max|d| %.3e\n", worst); exit(1); }
-    snprintf(name, sizeof(name), "router NE=%u k=%u T=%u: softmax top-k", NE, k, T);
+    if (worst > 1e-6) { fprintf(stderr, "router%s weights max|d| %.3e\n", tag, worst); exit(1); }
+    snprintf(name, sizeof(name), "router%s NE=%u k=%u T=%u: softmax top-k", tag, NE, k, T);
     printf("  %-44s ok  max|d|=%.2e\n", name, worst);
-    free(w); free(sel); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gl); free(logits);
+    free(w); free(sel); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gl);
+    if (!logits_in) free(logits);
+}
+
+/* The k-th place landing inside an exact tie is the one case random logits
+ * cannot reach and the one where a changed tie-break silently changes which
+ * experts run; k = 1 and k = 10 on the same patterns, at both NE sizes. */
+static void test_router_ties(arena_t *a) {
+    const uint32_t T = 4;
+    float *lg = tie_logits(512, T);
+    test_router(a, 512, 10, T, lg, " (tied)");
+    test_router(a, 512, 1, T, lg, " (tied k=1)");
+    free(lg);
+    lg = tie_logits(32, T);
+    test_router(a, 32, 10, T, lg, " (tied)");
+    test_router(a, 32, 1, T, lg, " (tied k=1)");
+    free(lg);
 }
 
 /* ---- attention + indexer ---- */
@@ -2977,28 +3025,94 @@ static void bench_hc_norm_reuse(arena_t *a) {
 
 typedef int (*bench_fn)(void *ud);
 
-static double bench_run(const char *name, bench_fn fn, void *ud, uint32_t reps) {
+/* Timed batches of `reps` calls, repeated `passes` times.  The printed
+ * microseconds and GB/s come from the fastest pass (a clock edge or a scheduler
+ * hiccup only ever inflates a pass) and `spread` is (slowest - fastest) /
+ * fastest, so an entry whose number moves between passes says so here rather
+ * than being read as a single sample.  `weight_bytes` is the weight traffic one
+ * call reads, from which GB/s = bytes / seconds; 0 prints microseconds only.
+ * QWEN4_BENCH_REPS / QWEN4_BENCH_PASSES override the per-entry values, which is
+ * how a single shape is re-measured with more statistics (the audit's table
+ * used 300 reps x 5 passes). */
+static uint32_t bench_env_u32(const char *name, uint32_t fallback) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    const long parsed = strtol(value, NULL, 10);
+    return parsed > 0 && parsed <= 1000000 ? (uint32_t)parsed : fallback;
+}
+
+/* An idle GPU ramps its clock for the first few hundred milliseconds, which is
+ * worth tens of percent on a short entry: a run of one small shape would
+ * otherwise report whatever fraction of the clock it happened to catch, and the
+ * same entry would move between runs.  Every run therefore does one long
+ * untimed batch of the first entry's call before any timing, sized from that
+ * call's own cost so it holds for a 6 us shape and a 15 ms one alike.
+ * QWEN4_BENCH_WARMUP_MS overrides the target (0 disables). */
+static void bench_gpu_warmup(bench_fn fn, void *ud) {
+    static bool done;
+    if (done) return;
+    done = true;
+    const uint32_t target_ms = bench_env_u32("QWEN4_BENCH_WARMUP_MS", 250u);
+    if (target_ms == 0) return;
+    const double t0 = bench_now();
+    require_ok(ds4_gpu_begin_commands(), "warm begin");
+    require_ok(fn(ud), "warm");
+    require_ok(ds4_gpu_end_commands(), "warm end");
+    require_ok(ds4_gpu_synchronize(), "warm sync");
+    const double cost = bench_now() - t0;                      /* one call, batch overhead included */
+    uint32_t batch = (uint32_t)((target_ms / 1000.0) / (cost > 1e-9 ? cost : 1e-9));
+    if (batch < 8u) batch = 8u;
+    if (batch > 200000u) batch = 200000u;
+    for (int round = 0; round < 3 && (bench_now() - t0) * 1e3 < (double)target_ms; round++) {
+        require_ok(ds4_gpu_begin_commands(), "warm begin");
+        for (uint32_t i = 0; i < batch; i++) require_ok(fn(ud), "warm");
+        require_ok(ds4_gpu_end_commands(), "warm end");
+        require_ok(ds4_gpu_synchronize(), "warm sync");
+    }
+}
+
+static double bench_run_bytes(const char *name, bench_fn fn, void *ud, uint32_t reps,
+                              uint64_t weight_bytes, uint32_t passes) {
     const char *only = getenv("QWEN4_BENCH_ONLY");
     if (only && only[0] && !strstr(name, only)) return 0.0;
-    if (only && only[0]) { for (uint32_t i = 0; i < 20; i++) fn(ud); }   /* single-bench runs: warm the clocks */
+    reps = bench_env_u32("QWEN4_BENCH_REPS", reps);
+    passes = bench_env_u32("QWEN4_BENCH_PASSES", passes);
+    bench_gpu_warmup(fn, ud);
     require_ok(ds4_gpu_begin_commands(), "begin");
     require_ok(fn(ud), name);
     require_ok(ds4_gpu_end_commands(), "end");
     require_ok(ds4_gpu_synchronize(), "sync");
-    const double t0 = bench_now();
-    require_ok(ds4_gpu_begin_commands(), "begin");
-    for (uint32_t r = 0; r < reps; r++) require_ok(fn(ud), name);
-    require_ok(ds4_gpu_end_commands(), "end");
-    require_ok(ds4_gpu_synchronize(), "sync");
-    const double us = 1e6 * (bench_now() - t0) / reps;
-    printf("  %-44s %8.1f us\n", name, us);
-    return us;
+    if (passes == 0) passes = 1;
+    double best = 0.0, worst = 0.0;
+    for (uint32_t p = 0; p < passes; p++) {
+        const double t0 = bench_now();
+        require_ok(ds4_gpu_begin_commands(), "begin");
+        for (uint32_t r = 0; r < reps; r++) require_ok(fn(ud), name);
+        require_ok(ds4_gpu_end_commands(), "end");
+        require_ok(ds4_gpu_synchronize(), "sync");
+        const double us = 1e6 * (bench_now() - t0) / reps;
+        if (p == 0 || us < best) best = us;
+        if (p == 0 || us > worst) worst = us;
+    }
+    if (weight_bytes) {
+        printf("  %-38s %8.2f MB %9.2f us %8.1f GB/s  spread %5.1f%%\n", name,
+               (double)weight_bytes / 1e6, best,
+               (double)weight_bytes / (best * 1e-6) / 1e9,
+               100.0 * (worst / best - 1.0));
+    } else {
+        printf("  %-44s %8.1f us\n", name, best);
+    }
+    return best;
+}
+
+static double bench_run(const char *name, bench_fn fn, void *ud, uint32_t reps) {
+    return bench_run_bytes(name, fn, ud, reps, 0, 1);
 }
 
 typedef struct {
     arena_t *a;
-    uint64_t off[14];
-    ds4_gpu_tensor *t[43];
+    uint64_t off[22];
+    ds4_gpu_tensor *t[50];
     uint32_t n[3];
 } bench_ctx;
 
@@ -3148,6 +3262,317 @@ static int bench_p_moe_mm_q4k_lo(void *ud) { static ds4_gpu_tensor *st[6]; stati
 static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 2, 16, 48, 128, NULL, 0u, NULL, 0u); }
 
+/* ------------------------------------------------------------------------
+ * Dense decode projection throughput, BF16-spine shapes.
+ *
+ * The three paths a dense decode projection can take, at the exact shapes the
+ * BF16-spine pack uses: ds4_gpu_qwen4_multi_gemv_tensor (bf16, type 30),
+ * ds4_gpu_matmul_f16_tensor (f16 reference) and
+ * ds4_gpu_qwen4_matmul_q8_0_tensor (q8_0 reference).  Each entry prints the
+ * weight bytes one call reads, the microseconds that took and the resulting
+ * GB/s, so the three are directly comparable per shape.
+ *
+ * Two rates per shape, because they answer different questions:
+ *   warm - the same matrix every rep, so after the first rep it is cache
+ *          resident.  This is the audit's table: it ranks kernels by how well
+ *          they use the machine with the data close, and it is NOT the rate
+ *          the model gets.
+ *   cold - the offset rotates through a region several times larger than the
+ *          cache, so every rep reads bytes last touched a whole region ago.
+ *          This is the rate a decode token sees, where each weight is read
+ *          exactly once; it is the column to rank optimisation work by.
+ * ---------------------------------------------------------------------- */
+
+/* Weight bytes one row of `in_dim` weights occupies, the same accounting the
+ * GB/s column uses: 2 B per weight for bf16/f16, 34 B per 32 weights q8_0. */
+static uint64_t bench_row_bytes(uint32_t type, uint64_t in_dim) {
+    return type == 8u ? (in_dim / 32u) * 34u : in_dim * 2u;
+}
+
+/* One bench region per weight type, `region_bytes` of type-`type` weights laid
+ * out as whole copies of a shape's matrix end to end, which is what the cold
+ * benches rotate their offset through.  The arena is an anonymous mmap, so
+ * every page is written here on purpose: an untouched page would be faulted in
+ * during the first timed rep and counted as read time.  The patterns keep every
+ * element a normal number (bf16/f16 exponents 0x3f00/0x3800, q8_0 blocks at
+ * d = 0.5), so no kernel is nudged onto a denormal or zero path. */
+static uint64_t bench_region(arena_t *a, uint32_t type, uint64_t region_bytes) {
+    const uint64_t off = arena_alloc(a, region_bytes);
+    uint8_t *p = a->base + off;
+    uint32_t s = 0x9e3779b9u;
+    if (type == 8u) {
+        for (uint64_t b = 0; b + 34u <= region_bytes; b += 34u) {
+            p[b] = 0x00; p[b + 1] = 0x38;                    /* half d = 0.5 */
+            for (uint64_t j = 2; j < 34u; j++) { s = s * 1664525u + 1013904223u; p[b + j] = (uint8_t)(s >> 24); }
+        }
+    } else {
+        const uint16_t exp = type == 30u ? 0x3f00u : 0x3800u;
+        const uint16_t mask = type == 30u ? 0xffu : 0x3ffu;
+        uint16_t *w = (uint16_t *)p;
+        for (uint64_t i = 0; i < region_bytes / 2u; i++) {
+            s = s * 1664525u + 1013904223u;
+            w[i] = (uint16_t)(exp | ((s >> 16) & mask));
+        }
+    }
+    return off;
+}
+
+/* One region per weight type, sized so a pass over it cannot stay cached.  The
+ * cold benches rotate a shape's weight offset through its region: `copies` is
+ * how many matrices of that shape fit, and every rep reads the next copy. */
+#define BENCH_BF16_REGION (192ull << 20)
+#define BENCH_F16_REGION  (192ull << 20)
+#define BENCH_Q8_REGION   (192ull << 20)
+#define BENCH_STREAM_MIB  512ull
+
+typedef struct {
+    bench_ctx *c;
+    uint32_t   in_dim, out_rows, type;
+    uint64_t   region_off, matrix_bytes, copies;
+    bool       cold;
+    bool       dep;                /* chain every rep on the previous rep's output */
+    uint32_t   rep;                /* rotation cursor */
+    /* Multi-row (verify) variant: 0/1 keeps the historical single-token entry
+     * and its x/out tensors; 2 or 3 is the T=2/T=3 verify dispatch the MTP
+     * cycle runs, which reads the SAME weight rows once per token from
+     * grid.y = 0..T-1 (see kernel_qwen4_multi_gemv: weight row depends on
+     * tgpig.x only).  x/out are the T-row buffers then. */
+    uint32_t   tokens;
+    ds4_gpu_tensor *x, *out;
+} shape_bench;
+
+/* The one line that separates the two rates: warm reads copy 0 forever, cold
+ * walks copy 0, 1, 2, ... and wraps. */
+static uint64_t shape_weight_off(shape_bench *s) {
+    if (!s->cold || s->copies <= 1u) return s->region_off;
+    return s->region_off + (uint64_t)(s->rep++ % s->copies) * s->matrix_bytes;
+}
+
+/* bf16: the BF16-spine path.  The host picks the k-split from the row count,
+ * so the bench runs the shipped policy, not a forced one.  With s->tokens set
+ * the same entry is the verify dispatch: T rows, same weights, grid.y = T. */
+static int bench_shape_bf16(void *ud) {
+    shape_bench *s = ud;
+    bench_ctx *c = s->c;
+    ds4_gpu_tensor *outs[1] = { s->out ? s->out : c->t[44] };
+    const uint64_t offs[1] = { shape_weight_off(s) };
+    const uint32_t types[1] = { 30u };
+    const uint32_t rows[1] = { s->out_rows };
+    return ds4_gpu_qwen4_multi_gemv_tensor(s->x ? s->x : c->t[43], s->tokens ? s->tokens : 1u,
+                                           s->in_dim, 1, outs,
+                                           c->a->base, c->a->size, offs, types, rows);
+}
+/* The same T-row verify entry for the f16 and q8_0 codecs: the identical
+ * qwen4_multi_gemv call with s->type, so the T=1/2/3 column above reads the
+ * marginal verify row the same way for all three types. */
+static int bench_shape_multirow(void *ud) {
+    shape_bench *s = ud;
+    bench_ctx *c = s->c;
+    ds4_gpu_tensor *outs[1] = { s->out ? s->out : c->t[44] };
+    const uint64_t offs[1] = { shape_weight_off(s) };
+    const uint32_t types[1] = { s->type };
+    const uint32_t rows[1] = { s->out_rows };
+    return ds4_gpu_qwen4_multi_gemv_tensor(s->x ? s->x : c->t[43], s->tokens ? s->tokens : 1u,
+                                           s->in_dim, 1, outs,
+                                           c->a->base, c->a->size, offs, types, rows);
+}
+/* The dependency variant of the same entry: x AND the output are the same
+ * tensor, so rep n's 320-row output lands inside the 10240-element activation
+ * rep n+1 reads.  Same shape, same entry point, same grid, same bytes, same
+ * cold rotation -- the only difference from bench_shape_bf16 is a true RAW
+ * hazard across the dispatch boundary, which is what the model has between
+ * every one of its ~824 dispatches and the bench's train does not.  With the
+ * batch encoder's serial dispatch type the next dispatch cannot start before
+ * this one's stores are visible, so if the model's per-dispatch cost comes
+ * from the dependency rather than from the kernel, this entry is where it
+ * shows. */
+static int bench_shape_bf16_dep(void *ud) {
+    shape_bench *s = ud;
+    bench_ctx *c = s->c;
+    ds4_gpu_tensor *outs[1] = { c->t[44] };
+    const uint64_t offs[1] = { shape_weight_off(s) };
+    const uint32_t types[1] = { 30u };
+    const uint32_t rows[1] = { s->out_rows };
+    return ds4_gpu_qwen4_multi_gemv_tensor(c->t[44], 1, s->in_dim, 1, outs,
+                                           c->a->base, c->a->size, offs, types, rows);
+}
+static int bench_shape_f16(void *ud) {
+    shape_bench *s = ud;
+    return ds4_gpu_matmul_f16_tensor(s->c->t[44], s->c->a->base, s->c->a->size,
+                                     shape_weight_off(s), s->in_dim, s->out_rows, s->c->t[43], 1);
+}
+static int bench_shape_q8(void *ud) {
+    shape_bench *s = ud;
+    return ds4_gpu_qwen4_matmul_q8_0_tensor(s->c->t[44], s->c->a->base, s->c->a->size,
+                                            shape_weight_off(s), s->in_dim, s->out_rows, s->c->t[43], 1);
+}
+/* One bench call = one dispatch of `a` and one of `b`, back to back in the
+ * same encoder.  Against the two entries measured separately this is the
+ * interleaving question: a shape that reaches its per-shape floor alone, does
+ * it keep it when the queue carries a different projection's work? */
+typedef struct { shape_bench *a, *b; } bench_alt_ctx;
+static int bench_alt(void *ud) {
+    bench_alt_ctx *x = ud;
+    const int ra = bench_shape_bf16(x->a);
+    const int rb = bench_shape_bf16(x->b);
+    return (ra && rb) ? 1 : 0;
+}
+
+/* hc_*_up (320 -> 10240) is served by the dedicated gate/mix entry point, and
+ * the shipped BF16 pack keeps that weight bf16: the weight-type argument
+ * selects the same three weight walks at n_rank = 320. */
+static int bench_shape_mix(void *ud) {
+    shape_bench *s = ud;
+    return ds4_gpu_qwen4_hc_gate_mix_tensor(s->out ? s->out : s->c->t[44],
+                                            s->x ? s->x : s->c->t[4], s->c->t[5],
+                                            s->c->a->base, s->c->a->size, shape_weight_off(s),
+                                            s->type, s->tokens ? s->tokens : 1u, 2560u, 4u, 320u);
+}
+
+/* One probe struct for the two questions the dense-shape cold numbers cannot
+ * answer: does a dispatch carry a fixed toll that two consecutive dispatches
+ * cannot hide (overlap), and does it matter whether the pages a dispatch
+ * touches were touched recently (TLB reach).  `n` dispatches of `bytes` at
+ * `threadgroups` each, walking `span / bytes` chunks of the stream span; `rot`
+ * off moves the cursor every rep so successive reps -- and, with n > 1, the
+ * dispatches inside one rep -- read disjoint chunks. */
+typedef struct {
+    bench_ctx *c;
+    uint32_t   threadgroups, n;
+    uint64_t   bytes, span;
+    bool       rot;
+    uint32_t   rep;
+} stream_probe;
+typedef struct { bench_ctx *c; uint32_t threadgroups; uint64_t bytes; } stream_bench;
+#ifdef __APPLE__
+/* DRAM read ceiling: a range read alone, at a caller-chosen threadgroup count.
+ * The kernels above can only reach the rate their grid's memory-level
+ * parallelism allows, so these lines are the ceiling to read the cold column
+ * against, and sweeping the threadgroup count shows what the grid shape alone
+ * costs.  The range is read from the same mmap the weights live in. */
+static int bench_stream(void *ud) {
+    stream_bench *s = ud;
+    return ds4_gpu_qwen4_stream_read_bench_tensor(s->c->t[45], s->c->a->base, s->c->a->size,
+                                                  s->c->off[17], s->bytes, s->threadgroups);
+}
+
+/* `n` back-to-back reads of `bytes` each at `threadgroups` threadgroups.  With
+ * rot = false every rep re-reads the same chunk (the TLB-hit / L2-hit case);
+ * with rot = true it walks to the next chunk of `span` (the cold-page case the
+ * model is in, since it never re-reads a weight).  Independent dispatches: no
+ * dependency between them, which is the bench's own shape and the thing the
+ * dependency entry above varies. */
+static int bench_stream_n(void *ud) {
+    stream_probe *s = ud;
+    const uint64_t chunks = s->span && s->bytes ? s->span / s->bytes : 1ull;
+    int rc = 0;
+    for (uint32_t i = 0; i < s->n; i++) {
+        const uint64_t base = s->rot ? (uint64_t)(s->rep++ % (chunks ? chunks : 1ull)) * s->bytes : 0ull;
+        rc |= ds4_gpu_qwen4_stream_read_bench_tensor(s->c->t[45], s->c->a->base, s->c->a->size,
+                                                     s->c->off[17] + base, s->bytes, s->threadgroups) ? 0 : 1;
+    }
+    return rc ? 0 : 1;
+}
+#endif
+
+/* ------------------------------------------------------------------------
+ * Decode MoE at the pack's real routed types.
+ *
+ * The moe_mid/moe_down entries above measure q8_0 and q4_K, which this pack
+ * does not use for its experts: the routed gate/up rows are iq2_xxs (16, 66 B
+ * per 256 weights) and the routed down rows are q2_K (10, 84 B per 256).  So
+ * there was no decode measurement of the two types that carry the whole MoE
+ * byte budget, and a GB/s figure cannot compare them to q8_0 anyway because
+ * the codecs differ in bytes AND in bytes per element -- everything below is
+ * therefore read in ns per element (us * 1000 / elements per call).
+ *
+ * The call is the model's own: 10 routed slots + 1 shared slot, gate and up
+ * per row, T = m->tokens.  Element counts are 36.045e6 for mid (11 slots x 640
+ * rows x 2560 x gate+up) and 21.30e6 for down (11 x 2560 rows x 768 padded,
+ * which is what ds4_gpu_qwen4_moe_down_tensor builds for q2_K) -- the same
+ * 36.045e6 as the existing q8_0 mid entry, so those two compare per element
+ * directly.
+ *
+ * Every entry rotates its routed base one copy per rep through a region of
+ * whole 16-expert blocks, so a rep reads bytes last touched (copies-1) calls
+ * ago: at 9.34 GB/token nothing stays in cache, and a fixed-offset bench would
+ * report a rate the model never sees.  The selection picks 10 *distinct*
+ * experts (slot i -> expert i) because 10 slots over 4 experts would re-read
+ * one matrix inside a single dispatch and read L2, not DRAM.  The shared bf16
+ * slot is identical in every entry -- it rotates the same way inside the
+ * existing 192 MiB bf16 region -- so only the routed codec differs between
+ * them.  iq2_xxs and q2_K exist only in whole 256-element super-blocks, so the
+ * down rows are 768 wide (640 padded, see ds4_gpu_qwen4_moe_down_tensor).
+ * ---------------------------------------------------------------------- */
+#define BENCH_MOE_COPIES 6u
+
+typedef struct {
+    bench_ctx *c;
+    uint32_t   type;         /* routed weight type: 16 iq2_xxs, 10 q2_K, 8 q8_0 */
+    uint32_t   tokens;       /* T of the dispatch */
+    uint32_t   ff_dim;       /* routed in_dim: 2560 for mid, 640 or 768 for down */
+    uint64_t   block_off;    /* region of `copies` back-to-back 16-expert blocks */
+    uint64_t   block_bytes;  /* one 16-expert block */
+    uint32_t   copies;       /* gate+up pairs (mid) or down matrices in the region */
+    uint32_t   rep;
+} moe_type_bench;
+
+/* A region of `copies` back-to-back 16-expert blocks built by the same arena
+ * helper the correctness tests use, so every block holds real quantised data:
+ * a hand-filled pattern can produce an inf or a denormal scale and price
+ * arithmetic the model never does. */
+static uint64_t bench_moe_region(arena_t *a, uint32_t type, uint64_t experts, uint64_t rows,
+                                 uint64_t cols, uint32_t copies, uint64_t *block_bytes) {
+    double *shadow = NULL;
+    const uint64_t rows_all = experts * rows;
+    const uint64_t one = type == 16u ? arena_iq2_xxs(a, rows_all, cols, &shadow, 0.05f)
+                                     : arena_q2_K(a, rows_all, cols, &shadow, 0.05f);
+    free(shadow);
+    const uint64_t bytes = type == 16u ? rows_all * (cols / 256u) * 66u
+                                       : rows_all * (cols / 256u) * 84u;
+    const uint64_t region = arena_alloc(a, bytes * copies);
+    for (uint32_t i = 0; i < copies; i++)
+        memcpy(a->base + region + (uint64_t)i * bytes, a->base + one, (size_t)bytes);
+    *block_bytes = bytes;
+    return region;
+}
+
+/* mid: gate at the copy's first block, up at its second. */
+static int bench_moe_mid_type(void *ud) {
+    moe_type_bench *m = ud;
+    bench_ctx *c = m->c;
+    const uint32_t copy = m->rep++ % m->copies;
+    const uint64_t g = m->block_off + (uint64_t)copy * 2u * m->block_bytes;
+    const uint64_t sh_copy = 2ull * 640ull * 2560ull * 2ull;      /* shared gate + up, bf16 */
+    const uint32_t sh_copies = (uint32_t)(BENCH_BF16_REGION / sh_copy);
+    const uint64_t sh = c->off[14] + (uint64_t)(copy % (sh_copies ? sh_copies : 1u)) * sh_copy;
+    return ds4_gpu_qwen4_moe_mid_tensor(c->t[1], c->t[18], c->t[46], c->a->base, c->a->size,
+                                        g, g + m->block_bytes, m->type, 16u, m->tokens, 10u,
+                                        2560u, 640u, sh, sh + 640ull * 2560ull * 2ull, 30u);
+}
+
+/* down: the routed region holds down matrices only; the shared slot is a
+ * 2560-row bf16 down matrix of the same width as the routed rows (the host
+ * takes the shared row bytes from ff_dim too, so ff_dim = 768 makes the iq2_xxs
+ * and q2_K entries byte-for-byte and element-for-element identical, and
+ * ff_dim = 640 is the model's own padded q2_K dispatch). */
+static int bench_moe_down_type(void *ud) {
+    moe_type_bench *m = ud;
+    bench_ctx *c = m->c;
+    const uint32_t copy = m->rep++ % m->copies;
+    const uint64_t sh_copy = 2560ull * (uint64_t)m->ff_dim * 2ull;
+    const uint32_t sh_copies = (uint32_t)(BENCH_BF16_REGION / sh_copy);
+    const uint64_t sh = c->off[14] + (uint64_t)(copy % (sh_copies ? sh_copies : 1u)) * sh_copy;
+    return ds4_gpu_qwen4_moe_down_tensor(c->t[17], c->t[1], c->t[46], c->a->base, c->a->size,
+                                         m->block_off + (uint64_t)copy * m->block_bytes, m->type,
+                                         16u, m->tokens, 10u, m->ff_dim, 2560u, sh, 30u);
+}
+
+/* Elements and weight bytes one call of each reads; the labels carry them so a
+ * reader can divide the printed us into ns/element without the source. */
+#define BENCH_MOE_MID_ELEMS  (36045200ull)   /* 11 slots*640*2560 gate+up */
+#define BENCH_MOE_DOWN_ELEMS (21301300ull)   /* 11*2560*(768 routed / 640 shared) */
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -3176,6 +3601,37 @@ static void bench_dispatch(arena_t *a) {
     c.off[11] = arena_f32(a, 512ull * 2560, &sh, -0.05f, 0.05f); free(sh);
     c.off[12] = arena_q4_K(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);
     c.off[13] = arena_q4_K(a, 16ull * 640, 2560, &sh, 0.05f); free(sh);
+    c.off[14] = bench_region(a, 30u, BENCH_BF16_REGION);   /* bf16 region */
+    c.off[15] = bench_region(a, 1u, BENCH_F16_REGION);     /* f16 region */
+    c.off[16] = bench_region(a, 8u, BENCH_Q8_REGION);      /* q8_0 region */
+    c.off[17] = arena_alloc(a, BENCH_STREAM_MIB << 20);
+    memset(a->base + c.off[17], 0, (size_t)(BENCH_STREAM_MIB << 20));   /* back the span with pages: an untouched mmap would fault per page */
+    /* Routed-expert regions for the real pack's types (see bench_moe_mid_type):
+     * 16-expert blocks of iq2_xxs and q2_K, one region per shape the mid and
+     * down entries rotate inside. */
+    uint64_t blk_iq2_mid, blk_q2k_mid, blk_iq2_down, blk_q2k_down;
+    c.off[18] = bench_moe_region(a, 16u, 32, 640, 2560, BENCH_MOE_COPIES, &blk_iq2_mid);
+    c.off[19] = bench_moe_region(a, 10u, 32, 640, 2560, BENCH_MOE_COPIES, &blk_q2k_mid);
+    c.off[20] = bench_moe_region(a, 16u, 32, 2560, 768, BENCH_MOE_COPIES, &blk_iq2_down);
+    c.off[21] = bench_moe_region(a, 10u, 32, 2560, 768, BENCH_MOE_COPIES, &blk_q2k_down);
+    {   /* 10 distinct experts per row and no expert picked twice across the three
+         * rows (slot s of row t -> expert 10t+s): that is what the model does,
+         * and anything else would re-read a matrix inside one dispatch and
+         * measure L2 instead of DRAM at T = 2/3 */
+        int32_t sel[3 * 10];
+        for (int i = 0; i < 30; i++) sel[i] = i;
+        c.t[46] = ds4_gpu_tensor_alloc(3ull * 10 * 4);
+        require_ok(c.t[46] && ds4_gpu_tensor_write(c.t[46], 0, sel, sizeof(sel)), "moe bench selection");
+    }
+    {   /* x, the widest in_dim; the benches only read it, so one buffer serves every shape */
+        float *bx = rand_vec(10240ull, 1.0f);
+        c.t[43] = upload(bx, 10240);
+        free(bx);
+    }
+    c.t[44] = upload(NULL, 12288);                      /* out, the most output rows */
+    c.t[45] = upload(NULL, 4);                          /* stream sink */
+    c.t[47] = upload(NULL, 3ull * 10240);               /* x for the T=3 verify bench */
+    c.t[48] = upload(NULL, 3ull * 12288);               /* out for the T=3 verify bench */
     c.t[18] = upload(NULL, 256ull * 2560);        /* x for 256 tokens */
     c.t[19] = upload(NULL, 256ull * 10240);       /* wide scratch */
     c.t[1] = upload(NULL, 256ull * 10240);        /* scratch (also the GDN state) */
@@ -3331,6 +3787,284 @@ static void bench_dispatch(arena_t *a) {
     bench_run("moe_mid q4_K 10+1 slots T=1", bench_moe_mid_q4k, &c, 100);
     c.n[0] = 2;
     bench_run("moe_mid q4_K 10+1 slots T=2", bench_moe_mid_q4k, &c, 100);
+
+    /* The pack's own expert types, cold and per element (see bench_moe_mid_type).
+     * Elements per call: mid 36.045e6 for all three codecs, so the printed us
+     * divide straight into ns per element; down 21.30e6 for q2_K/iq2_xxs (768
+     * padded columns) and 18.02e6 for q8_0 (640).  Bytes per call:
+     *   mid  iq2_xxs 8.448 + 6.554 shared = 15.0 MB   (the q8_0 entry: 38.3 MB)
+     *   mid  q2_K   10.752 + 6.554        = 17.3 MB
+     *   mid  q8_0   34.816 + 6.554        = 41.4 MB
+     *   down q2_K    6.451 + 3.277        =  9.7 MB
+     *   down iq2_xxs 5.069 + 3.277        =  8.3 MB
+     *   down q8_0   17.408 + 3.277        = 20.7 MB
+     * Measured at T = 1, 2 and 3 because the profiler comparison needs the same
+     * number of walks per forward (--mtp verifies T = 2 or 3 rows, and the
+     * per-row kernels walk the routed weights once per row). */
+    {
+        static const uint64_t Q8_BLOCK = 16ull * 640ull * 2720ull;   /* == 16*2560*680 */
+        struct moe_kind { uint32_t type; uint64_t off, blk, bytes; const char *name; };
+        const struct moe_kind mids[3] = {
+            { 16u, c.off[18], blk_iq2_mid,  15001600ull, "moe_mid iq2_xxs" },
+            { 10u, c.off[19], blk_q2k_mid,  17305600ull, "moe_mid q2_K  " },
+            {  8u, c.off[16], Q8_BLOCK,     41369600ull, "moe_mid q8_0  " },
+        };
+        const struct moe_kind downs[4] = {
+            { 10u, c.off[21], blk_q2k_down,  9728000ull, "moe_down q2_K   @640" },
+            { 10u, c.off[21], blk_q2k_down, 10380800ull, "moe_down q2_K   @768" },
+            { 16u, c.off[20], blk_iq2_down,  9001600ull, "moe_down iq2_xxs@768" },
+            {  8u, c.off[16], Q8_BLOCK,     20684800ull, "moe_down q8_0   @640" },
+        };
+        for (unsigned k = 0; k < 3u; k++) {
+            moe_type_bench m;
+            char name[96];
+            /* x must hold T * 2560 floats for T = 3; t[18] is the 256-token
+             * buffer, and a written value keeps a denormal or NaN out of the
+             * accumulate (the arithmetic is the same, the timing would not be). */
+            require_ok(ds4_gpu_tensor_fill_f32(c.t[18], 0.1f, 3ull * 2560ull), "moe bench x fill");
+            memset(&m, 0, sizeof(m));
+            m.c = &c; m.type = mids[k].type; m.block_off = mids[k].off; m.block_bytes = mids[k].blk;
+            m.ff_dim = 2560u;
+            m.copies = mids[k].type == 8u ? (uint32_t)(BENCH_Q8_REGION / (2ull * Q8_BLOCK))
+                                          : BENCH_MOE_COPIES;
+            for (uint32_t T = 1; T <= 3u; T++) {
+                m.tokens = T;
+                snprintf(name, sizeof(name), "%s 10+1 slots T=%u COLD", mids[k].name, T);
+                bench_run_bytes(name, bench_moe_mid_type, &m, 300u, mids[k].bytes * T, 3u);
+            }
+        }
+        for (unsigned k = 0; k < 4u; k++) {
+            moe_type_bench m;
+            char name[96];
+            memset(&m, 0, sizeof(m));
+            m.c = &c; m.type = downs[k].type; m.block_off = downs[k].off; m.block_bytes = downs[k].blk;
+            m.ff_dim = strstr(downs[k].name, "@768") ? 768u : 640u;
+            m.copies = downs[k].type == 8u ? (uint32_t)(BENCH_Q8_REGION / Q8_BLOCK)
+                                           : BENCH_MOE_COPIES;
+            for (uint32_t T = 1; T <= 3u; T++) {
+                m.tokens = T;
+                snprintf(name, sizeof(name), "%s 10+1 slots T=%u COLD", downs[k].name, T);
+                bench_run_bytes(name, bench_moe_down_type, &m, 300u, downs[k].bytes * T, 3u);
+            }
+        }
+    }
+
+    /* Dense decode projections at the BF16-spine pack's shapes, warm and cold,
+     * bf16 against the f16 and q8_0 references.  See the block comment above
+     * bench_row_bytes for what separates the two rates. */
+    printf("  --- dense decode shapes, T=1: bf16 vs f16 vs q8_0 ---\n");
+    const uint64_t region_of_type[3] = { c.off[14], c.off[15], c.off[16] };
+    const uint64_t region_bytes_of_type[3] = { BENCH_BF16_REGION, BENCH_F16_REGION, BENCH_Q8_REGION };
+    const uint32_t bench_types[3] = { 30u, 1u, 8u };
+    const char *type_names[3] = { "bf16", "f16", "q8_0" };
+    /* in_dim -> out_rows and the tensor each pair stands for in the model */
+    static const struct { uint32_t in_dim, out_rows; const char *role; } bench_shapes[] = {
+        { 10240,   320, "hc_down" },
+        {  2560,   512, "router" },
+        {  2560,   640, "shared_gate_up" },
+        {  2560,   128, "indexer_k_proj" },
+        {   320, 10240, "hc_up" },
+        {  6144,  2560, "ssm_out" },
+        {  2560,  6144, "attn_gate" },
+        {  2560, 10240, "attn_qkv" },
+        {  2560, 12288, "attn_q" },
+    };
+    shape_bench hc_shape, ssm_shape;
+    bool have_hc = false, have_ssm = false;
+    for (unsigned si = 0; si < sizeof(bench_shapes) / sizeof(bench_shapes[0]); si++) {
+        const uint32_t in_dim = bench_shapes[si].in_dim, out_rows = bench_shapes[si].out_rows;
+        for (unsigned ti = 0; ti < 3u; ti++) {
+            const uint32_t type = bench_types[ti];
+            const uint64_t matrix_bytes = (uint64_t)bench_row_bytes(type, in_dim) * out_rows;
+            shape_bench s;
+            memset(&s, 0, sizeof(s));
+            s.c = &c; s.in_dim = in_dim; s.out_rows = out_rows; s.type = type;
+            s.region_off = region_of_type[ti]; s.matrix_bytes = matrix_bytes;
+            s.copies = region_bytes_of_type[ti] / matrix_bytes;
+            if (s.copies < 1u) s.copies = 1u;
+            const bench_fn fn = in_dim == 320u ? bench_shape_mix
+                              : type == 30u ? bench_shape_bf16
+                              : type == 1u ? bench_shape_f16 : bench_shape_q8;
+            char name[96];
+            snprintf(name, sizeof(name), "%u->%u %s %s warm", in_dim, out_rows, bench_shapes[si].role, type_names[ti]);
+            bench_run_bytes(name, fn, &s, 300u, matrix_bytes, 3u);
+            /* Cold: a pass must sweep the region, so reps scale with the copy
+             * count; the working set a pass reads is the whole region. */
+            s.cold = true;
+            /* Keep the two shapes the interleaving entry mixes (hc_down and
+             * the 6144->2560 output projection) with their own rotation
+             * cursors, taken before the cold run below advances `s.rep`. */
+            if (type == 30u && in_dim == 10240u && out_rows == 320u) { hc_shape = s; have_hc = true; }
+            if (type == 30u && in_dim == 6144u && out_rows == 2560u) { ssm_shape = s; have_ssm = true; }
+            uint32_t reps = (uint32_t)(4ull * s.copies);
+            if (reps < 24u) reps = 24u;
+            if (reps > 2048u) reps = 2048u;
+            snprintf(name, sizeof(name), "%u->%u %s %s COLD x%llu", in_dim, out_rows, bench_shapes[si].role,
+                     type_names[ti], (unsigned long long)s.copies);
+            bench_run_bytes(name, fn, &s, reps, matrix_bytes, 3u);
+            /* The same entry with the dispatch chain made dependent (see
+             * bench_shape_bf16_dep): the one measurement that separates "the
+             * kernel is slow in the model" from "a dependent chain of
+             * dispatches is slow". */
+            if (fn == bench_shape_bf16) {
+                shape_bench d = s;
+                d.dep = true;
+                d.rep = 0;
+                snprintf(name, sizeof(name), "%u->%u %s %s COLD x%llu DEP", in_dim, out_rows,
+                         bench_shapes[si].role, type_names[ti], (unsigned long long)s.copies);
+                bench_run_bytes(name, bench_shape_bf16_dep, &d, reps, matrix_bytes, 3u);
+            }
+        }
+    }
+    /* Interleaving: hc_down and the 6144->2560 output projection alternating,
+     * one of each per call, against the same two entries measured alone in the
+     * cold column above.  If the pair costs the sum of the two, a shape that
+     * holds its rate in a homogeneous train also holds it in a mixed one. */
+    if (have_hc && have_ssm) {
+        bench_alt_ctx ac = { &hc_shape, &ssm_shape };
+        bench_run_bytes("hc_down + ssm_out alternating COLD", bench_alt, &ac, 100u,
+                        hc_shape.matrix_bytes + ssm_shape.matrix_bytes, 3u);
+    }
+    /* The MTP verify dispatch: T = 2 or 3 rows through the SAME kernel, the
+     * SAME weight rows (kernel_qwen4_multi_gemv takes the weight row from
+     * tgpig.x alone) and grid.y = T.  A cycle at depth 1 is one of these plus
+     * one T=1 draft row, so this is the marginal cost of the extra row that
+     * decides MTP's gain.  T=1 here is the same measurement as the dense COLD
+     * column above (same entry, same rotation); the ratio us(T)/us(1) is the
+     * marginal row.  Bytes per call are T * matrix_bytes because every row
+     * walks the whole matrix -- the second row's bytes only stop being DRAM
+     * bytes if its loads hit L2.
+     *
+     * hc_up (320->10240) is the one shape whose host path already has a
+     * two-row kernel: n_tokens == 2 selects QWEN4_K_HC_GATE_MIX_PAIR_BF16
+     * with grid.y = 1 and both tokens in the threadgroup.  It is measured
+     * through the same entry point for that reason.
+     *
+     * The bf16 half of each shape is the spine pack's own type; the f16 and
+     * q8_0 halves are the other two codecs a pack could ship, measured through
+     * the same entry point (both take the same multi-row dispatch when the
+     * host's wide-walk policy admits the type), so the three ratios us(T)/us(1)
+     * are read the same way. */
+    printf("  --- dense decode shapes, T=1/2/3 COLD: the marginal verify row ---\n");
+    for (unsigned si = 0; si < sizeof(bench_shapes) / sizeof(bench_shapes[0]); si++) {
+        const uint32_t in_dim = bench_shapes[si].in_dim, out_rows = bench_shapes[si].out_rows;
+        for (unsigned ti = 0; ti < 3u; ti++) {
+        const uint32_t type = bench_types[ti];
+        const uint64_t row_bytes = bench_row_bytes(type, in_dim);
+        const uint64_t matrix_bytes = row_bytes * out_rows;
+        shape_bench s;
+        memset(&s, 0, sizeof(s));
+        s.c = &c; s.in_dim = in_dim; s.out_rows = out_rows; s.type = type;
+        s.region_off = region_of_type[ti]; s.matrix_bytes = matrix_bytes; s.cold = true;
+        s.copies = region_bytes_of_type[ti] / matrix_bytes;
+        if (s.copies < 1u) s.copies = 1u;
+        s.x = c.t[47]; s.out = c.t[48];
+        const bench_fn fn = in_dim == 320u ? bench_shape_mix
+                          : type == 30u ? bench_shape_bf16 : bench_shape_multirow;
+        for (uint32_t T = 1; T <= 3u; T++) {
+            if (in_dim == 320u && T == 3u) break;   /* pair kernel covers T<=2; see bench_shape_mix */
+            char name[96];
+            s.tokens = T;
+            uint32_t reps = (uint32_t)(4ull * s.copies);
+            if (reps < 24u) reps = 24u;
+            if (reps > 2048u) reps = 2048u;
+            snprintf(name, sizeof(name), "%u->%u %s %s T=%u COLD x%llu", in_dim, out_rows,
+                     bench_shapes[si].role, type_names[ti], T, (unsigned long long)s.copies);
+            bench_run_bytes(name, fn, &s, reps, matrix_bytes * T, 3u);
+        }
+        }
+    }
+    /* Bandwidth or not: the same shape at half the weight bytes.  The weight
+     * row is the only thing `in_dim` changes here, so if the marginal row is
+     * a re-read of the weight row its cost tracks in_dim; a cost that is flat
+     * in in_dim is launch/occupancy, not bytes.  Two shapes whose row bytes
+     * and row counts both differ by 2x: hc_down (10240->320) against
+     * 5120->320, and ssm_out (6144->2560) against 3072->2560. */
+    {
+        static const uint32_t half_in_dim[] = { 10240u, 6144u };
+        static const uint32_t half_rows[]   = { 320u,   2560u };
+        for (unsigned h = 0; h < 2u; h++) {
+            const uint32_t in_dim = half_in_dim[h] / 2u, out_rows = half_rows[h];
+            const uint64_t matrix_bytes = bench_row_bytes(30u, in_dim) * out_rows;
+            shape_bench s;
+            memset(&s, 0, sizeof(s));
+            s.c = &c; s.in_dim = in_dim; s.out_rows = out_rows; s.type = 30u;
+            s.region_off = c.off[14]; s.matrix_bytes = matrix_bytes; s.cold = true;
+            s.copies = BENCH_BF16_REGION / matrix_bytes;
+            s.x = c.t[47]; s.out = c.t[48];
+            for (uint32_t T = 1; T <= 3u; T++) {
+                char name[96];
+                s.tokens = T;
+                uint32_t reps = (uint32_t)(4ull * s.copies);
+                if (reps < 24u) reps = 24u;
+                if (reps > 2048u) reps = 2048u;
+                snprintf(name, sizeof(name), "%u->%u bf16 T=%u COLD (in_dim halved)", in_dim, out_rows, T);
+                bench_run_bytes(name, bench_shape_bf16, &s, reps, matrix_bytes * T, 3u);
+            }
+        }
+    }
+#ifdef __APPLE__
+    /* The ceiling the cold column is judged against, swept over the grid sizes
+     * the narrow shapes ship (40/640/5120 threadgroups), the widest grid that
+     * still covers the range with one 16 B vector per thread (tg=max), and the
+     * range size the earlier ad-hoc probe used, so the two can be compared. */
+    printf("  --- DRAM stream ceiling: pure read, 16 B per thread ---\n");
+    static const uint64_t stream_mib[] = { 256ull, BENCH_STREAM_MIB };
+    static const uint32_t stream_tgs[] = { 40u, 640u, 5120u, 20480u, 0u };
+    for (unsigned m = 0; m < sizeof(stream_mib) / sizeof(stream_mib[0]); m++) {
+        for (unsigned k = 0; k < sizeof(stream_tgs) / sizeof(stream_tgs[0]); k++) {
+            stream_bench sb = { &c, stream_tgs[k], stream_mib[m] << 20 };
+            char name[96];
+            if (stream_tgs[k]) snprintf(name, sizeof(name), "stream %llu MiB tg=%u", (unsigned long long)stream_mib[m], stream_tgs[k]);
+            else snprintf(name, sizeof(name), "stream %llu MiB tg=max", (unsigned long long)stream_mib[m]);
+            bench_run_bytes(name, bench_stream, &sb, 20u, stream_mib[m] << 20, 3u);
+        }
+    }
+#endif
+    /* Two questions the per-shape entries above cannot answer, both at the
+     * hc_down dispatch's own geometry (a 6 MiB chunk at 160 threadgroups =
+     * ~39 KB per threadgroup, the model's 6.55 MB / 160 TG).
+     *
+     * Overlap: are two independent dispatches issued back-to-back in one
+     * encoder able to run at the same time?  `1 x 6 MiB` is the single, `2 x
+     * 6 MiB disjoint` is the pair (sum of the two, against 2 x the single),
+     * and `1 x 12 MiB` is the line the pair would meet if the second
+     * dispatch's ramp started while the first was still streaming.
+     *
+     * TLB: the same bytes at the same geometry, once re-reading one chunk
+     * (its pages stay in the TLB) and once walking a fresh chunk every rep
+     * (every page walked cold, which is the model's case: it never re-reads a
+     * weight).  A 6 MiB dispatch touches ~400 pages either way, so a gap here
+     * is what a page walk costs across a whole dispatch, and no gap says the
+     * TLB is not what separates the model's rate from the bench's. */
+#ifdef __APPLE__
+    printf("  --- dispatch overlap and cold-page (TLB) probes, hc_down geometry ---\n");
+    {
+        const uint64_t chunk = 6ull << 20;
+        const uint64_t span = BENCH_STREAM_MIB << 20;
+        stream_probe p = { &c, 160u, 1u, chunk, 0, false, 0 };        /* same chunk every rep: L2/TLB warm */
+        bench_run_bytes("stream 1 x 6 MiB tg=160 same chunk", bench_stream_n, &p, 200u, chunk, 3u);
+        p.span = span; p.rot = true;
+        bench_run_bytes("stream 1 x 6 MiB tg=160 COLD", bench_stream_n, &p, 200u, chunk, 3u);
+        p.n = 2u;
+        bench_run_bytes("stream 2 x 6 MiB tg=160 COLD same chunk", bench_stream_n, &p, 100u, chunk * 2u, 3u);
+        p.rot = true; p.rep = 0;
+        bench_run_bytes("stream 2 x 6 MiB tg=160 COLD DISJOINT", bench_stream_n, &p, 100u, chunk * 2u, 3u);
+        p.n = 1u; p.bytes = chunk * 2u;
+        bench_run_bytes("stream 1 x 12 MiB tg=160 COLD", bench_stream_n, &p, 100u, chunk * 2u, 3u);
+        /* What the grid alone buys on a cold 6 MiB range: the campaign's
+         * per-dispatch toll model was fitted on probes that shrank the
+         * threadgroup count together with the byte count, so the two levers
+         * are separated here (bytes fixed, grid swept). */
+        static const uint32_t sweep_tg[] = { 40u, 80u, 160u, 320u, 640u, 1280u, 2560u };
+        for (unsigned k = 0; k < sizeof(sweep_tg) / sizeof(sweep_tg[0]); k++) {
+            stream_probe q = { &c, sweep_tg[k], 1u, chunk, BENCH_STREAM_MIB << 20, true, 0 };
+            char nm[96];
+            snprintf(nm, sizeof(nm), "stream 6 MiB tg=%u rot", sweep_tg[k]);
+            bench_run_bytes(nm, bench_stream_n, &q, 200u, chunk, 3u);
+        }
+    }
+#endif
 }
 
 /* four projections of one input, mixed weight types (q8_0, bf16, q4_0, f16) */
@@ -3349,8 +4083,9 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     for (int i = 0; i < 4; i++) outs[i] = upload(NULL, (uint64_t)T * rows[i]);
     /* The host picks a k-split from the row count; force each value so the
      * slice-sum path and the whole-row walk both meet the same reference.
-     * ksplit is a live control (like the other qwen4 A/B switches). */
-    const char *ks[] = { "1", "2", "4", NULL };
+     * ksplit is a live control (like the other qwen4 A/B switches); 8 is the
+     * shipped narrow-projection value (8 SIMD groups of 256 threads). */
+    const char *ks[] = { "1", "2", "4", "8", NULL };
     for (int k = 0; ks[k]; k++) {
         setenv("DS4_QWEN4_GEMV_KSPLIT", ks[k], 1);
         require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, E, 4, outs, a->base, a->size, offs, types, rows), "multi gemv");
@@ -3546,9 +4281,778 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 }
 #endif
 
+/* ================= T=1 vs T>=2 numeric alignment =========================
+ *
+ * The MTP drafter computes a position with a T=1 dispatch; the verifier
+ * recomputes the same position inside a T=2/T=3 dispatch.  If the two paths
+ * round differently, the verifier rejects drafts the drafter got right by its
+ * own arithmetic: a throughput loss with no quality benefit.  Acceptance in
+ * this runtime is measurably numerics-sensitive, so each probe below runs the
+ * same computation two ways on identical inputs and compares the raw float
+ * bits.  The metric is exact equality -- the only property that provably
+ * cannot flip an argmax -- plus the magnitude of the deviations where they
+ * exist so the size can be judged.
+ *
+ * Every probe is read-only with respect to shipped code: no source outside
+ * this file is changed, and the kernels are A/B'd through their existing
+ * entry points and env knobs. */
+#ifdef __APPLE__
+
+#define EQ_MAX_DEV 262144   /* cap on retained deviations (report notes truncation) */
+
+typedef struct {
+    const char *what;
+    uint64_t pos_tested, pos_differ;      /* positions/rows compared */
+    uint64_t elem_tested, elem_differ;    /* floats compared */
+    uint64_t max_ulp;
+    double max_rel, max_abs;
+    uint64_t ndev;
+    double *dev;
+} eq_stats;
+
+static void eq_begin(eq_stats *st, const char *what) {
+    memset(st, 0, sizeof(*st));
+    st->what = what;
+    st->dev = malloc(EQ_MAX_DEV * sizeof(double));
+    require_ok(st->dev != NULL, "equivalence scratch");
+}
+
+/* Total-order ULP distance: the standard bits mapping that treats +0/-0 as
+ * adjacent and keeps NaN/inf far away. */
+static uint64_t f32_ulp_gap(float a, float b) {
+    int32_t ia, ib;
+    int64_t x, y;
+    memcpy(&ia, &a, sizeof(ia));
+    memcpy(&ib, &b, sizeof(ib));
+    x = ia < 0 ? (int64_t)0x80000000 - (int64_t)ia : (int64_t)ia;
+    y = ib < 0 ? (int64_t)0x80000000 - (int64_t)ib : (int64_t)ib;
+    return (uint64_t)(x > y ? x - y : y - x);
+}
+
+static void eq_add(eq_stats *st, const float *a, const float *b, uint64_t n) {
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t ab, bb;
+        st->elem_tested++;
+        memcpy(&ab, a + i, sizeof(ab));
+        memcpy(&bb, b + i, sizeof(bb));
+        if (ab == bb) continue;
+        st->elem_differ++;
+        if ((ab & 0x7f800000u) == 0x7f800000u || (bb & 0x7f800000u) == 0x7f800000u) continue;
+        const double da = fabs((double)a[i]), db = fabs((double)b[i]);
+        const double den = da > db ? da : db;
+        const double diff = fabs((double)a[i] - (double)b[i]);
+        const double rel = den > 0.0 ? diff / den : 0.0;
+        const uint64_t ulp = f32_ulp_gap(a[i], b[i]);
+        if (rel > st->max_rel) st->max_rel = rel;
+        if (diff > st->max_abs) st->max_abs = diff;
+        if (ulp > st->max_ulp) st->max_ulp = ulp;
+        if (st->ndev < EQ_MAX_DEV) st->dev[st->ndev++] = rel;
+    }
+}
+
+/* One position: every float of the row, counted as one position. */
+static void eq_row(eq_stats *st, const float *a, const float *b, uint64_t n) {
+    const uint64_t before = st->elem_differ;
+    eq_add(st, a, b, n);
+    st->pos_tested++;
+    if (st->elem_differ != before) st->pos_differ++;
+}
+
+static int eq_cmp_double(const void *x, const void *y) {
+    const double a = *(const double *)x, b = *(const double *)y;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static void eq_end(eq_stats *st) {
+    double med = 0.0;
+    if (st->ndev) {
+        qsort(st->dev, st->ndev, sizeof(double), eq_cmp_double);
+        med = st->dev[st->ndev / 2];
+    }
+    printf("  %-52s pos %6llu/%6llu differ (%6.2f%%)  elem %7llu differ  "
+           "max_rel %.3g  med_rel %.3g  max_ulp %llu  max_abs %.3g%s\n",
+           st->what, (unsigned long long)st->pos_differ, (unsigned long long)st->pos_tested,
+           st->pos_tested ? 100.0 * (double)st->pos_differ / (double)st->pos_tested : 0.0,
+           (unsigned long long)st->elem_differ, st->max_rel, med,
+           (unsigned long long)st->max_ulp, st->max_abs,
+           st->ndev == EQ_MAX_DEV ? " (dev list capped)" : "");
+    fflush(stdout);
+    free(st->dev);
+    st->dev = NULL;
+}
+
+/* The host's split geometry for one dispatch, exactly as
+ * ds4_gpu_qwen4_attn_decode_tensor computes it (QWEN4_ATTN_MAX_SPLITS = 64). */
+static void eq_attn_geom(uint32_t n_keys, uint32_t split_keys, uint32_t *n_splits, uint32_t *kps) {
+    uint32_t s = (n_keys + split_keys - 1u) / split_keys;
+    if (s < 1u) s = 1u;
+    if (s > 64u) s = 64u;
+    *n_splits = s;
+    *kps = (n_keys + s - 1u) / s;
+}
+
+/* The key ranges a row with row_keys keys is partitioned into when the host
+ * sized the dispatch from n_keys keys.  Split i covers
+ * [i*kps, min(row_keys, (i+1)*kps)) and the walk stops at the first empty one,
+ * which is what kernel_qwen4_attn_decode does (k0 = split*keys_per_split,
+ * k1 = min(n, ..); the splits past it write a v=0 partial). */
+static uint32_t eq_attn_row_ranges(uint32_t n_keys, uint32_t row_keys, uint32_t split_keys,
+                                   uint32_t *starts, uint32_t *ends) {
+    uint32_t s, kps, n = 0;
+    eq_attn_geom(n_keys, split_keys, &s, &kps);
+    for (uint32_t i = 0; i < s; i++) {
+        const uint32_t k0 = i * kps;
+        if (k0 >= row_keys) break;
+        starts[n] = k0;
+        ends[n] = row_keys < k0 + kps ? row_keys : k0 + kps;
+        n++;
+    }
+    if (n == 0) { starts[0] = 0; ends[0] = 0; n = 1; }
+    return n;
+}
+
+/* Does row 0's partition move between a T=1 dispatch at pos0 = a-1 and a T=2
+ * dispatch at pos0 = a-1?  T=1 sizes from a keys, T=2 from a+1, and both give
+ * row 0 its a keys. */
+static bool eq_attn_row0_moves(uint32_t a, uint32_t split_keys) {
+    uint32_t s1[64], e1[64], s2[64], e2[64];
+    const uint32_t n1 = eq_attn_row_ranges(a, a, split_keys, s1, e1);
+    const uint32_t n2 = eq_attn_row_ranges(a + 1u, a, split_keys, s2, e2);
+    if (n1 != n2) return true;
+    for (uint32_t i = 0; i < n1; i++) if (s1[i] != s2[i] || e1[i] != e2[i]) return true;
+    return false;
+}
+
+/* ---- 1. attention decode: row 0 of a T=2 dispatch vs a T=1 dispatch ----
+ *
+ * The host derives n_splits / keys_per_split once per dispatch from
+ * n_keys = pos0 + n_tokens, while the kernel gives each row its own key count
+ * pos0 + tok + 1.  So row 0 of a T=2 dispatch partitions its keys with the
+ * geometry of pos0+2 keys.  sw = whether the partition width of the row moved
+ * (the exact trigger), aud = the audit's rule (a % s == 0 || a % 32 == 0). */
+static void probe_attn_t_align(uint32_t H, uint32_t Hkv, uint32_t D,
+                               uint32_t p_lo, uint32_t p_hi, uint32_t split_keys) {
+    const uint32_t cap = p_hi + 4u;
+    const float scale = 1.0f / sqrtf((float)D);
+    char env[32], name[160];
+    snprintf(env, sizeof(env), "%u", split_keys);
+    setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", env, 1);
+
+    uint16_t *kch = malloc((uint64_t)cap * Hkv * D * 2u);
+    uint16_t *vch = malloc((uint64_t)cap * Hkv * D * 2u);
+    for (uint64_t i = 0; i < (uint64_t)cap * Hkv * D; i++) {
+        kch[i] = f32_to_f16(2.0f * frand() - 1.0f);
+        vch[i] = f32_to_f16(2.0f * frand() - 1.0f);
+    }
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    require_ok(kc && vc, "attn align cache alloc");
+    require_ok(ds4_gpu_tensor_write(kc, 0, kch, (uint64_t)cap * Hkv * D * 2u), "attn align k write");
+    require_ok(ds4_gpu_tensor_write(vc, 0, vch, (uint64_t)cap * Hkv * D * 2u), "attn align v write");
+    float *qh = rand_vec((uint64_t)2 * H * D, 1.0f);
+    float *gh = rand_vec((uint64_t)2 * H * D, 0.5f);
+    ds4_gpu_tensor *gq = upload(qh, (uint64_t)2 * H * D);
+    ds4_gpu_tensor *gg = upload(gh, (uint64_t)2 * H * D);
+    ds4_gpu_tensor *o1 = upload(NULL, (uint64_t)H * D);
+    ds4_gpu_tensor *o2 = upload(NULL, (uint64_t)2 * H * D);
+    ds4_gpu_tensor *pt1 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1, H, D));
+    ds4_gpu_tensor *pt2 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(2, H, D));
+    require_ok(pt1 != NULL && pt2 != NULL, "attn align partial alloc");
+
+    float *r1 = malloc((uint64_t)H * D * sizeof(float));
+    float *r2 = malloc((uint64_t)H * D * sizeof(float));
+    eq_stats st;
+    snprintf(name, sizeof(name), "attn row0 T=1 vs T=2 row0 (sk=%u, p=%u..%u)",
+             split_keys, p_lo, p_hi - 1u);
+    eq_begin(&st, name);
+    uint64_t pred_differ = 0, pred_hit = 0, aud_differ = 0, aud_hit = 0;
+    for (uint32_t p = p_lo; p < p_hi; p++) {
+        const uint32_t a = p + 1u;
+        /* row 0's own partition under each dispatch */
+        const bool pred = eq_attn_row0_moves(a, split_keys);
+        const uint32_t s = (a + 31u) / 32u;
+        const bool aud = (s && (a % s == 0u)) || (a % 32u == 0u);
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(o1, gq, gg, kc, vc, NULL, NULL, pt1,
+                                                    1u, H, Hkv, D, p, false, 0u, scale), "attn align T=1");
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(o2, gq, gg, kc, vc, NULL, NULL, pt2,
+                                                    2u, H, Hkv, D, p, false, 0u, scale), "attn align T=2");
+        require_ok(ds4_gpu_tensor_read(o1, 0, r1, (uint64_t)H * D * 4u), "attn align out1 read");
+        require_ok(ds4_gpu_tensor_read(o2, 0, r2, (uint64_t)H * D * 4u), "attn align out2 read");
+        const uint64_t before = st.elem_differ;
+        eq_row(&st, r1, r2, (uint64_t)H * D);
+        const bool obs = st.elem_differ != before;
+        /* the rule predicts the partition moves; the observation is that the
+         * output moves.  A rule can only be scored against what it claims. */
+        if (pred) { pred_differ++; if (obs) pred_hit++; }
+        else if (!obs) pred_hit++;
+        if (aud) { aud_differ++; if (obs) aud_hit++; }
+        else if (!obs) aud_hit++;
+    }
+    eq_end(&st);
+    printf("     partition rule: predicted move at %llu/%llu positions, correct %llu/%llu; "
+           "audit rule (a%%s==0 || a%%32==0) predicted %llu, correct %llu/%llu\n",
+           (unsigned long long)pred_differ, (unsigned long long)(p_hi - p_lo),
+           (unsigned long long)pred_hit, (unsigned long long)(p_hi - p_lo),
+           (unsigned long long)aud_differ,
+           (unsigned long long)aud_hit, (unsigned long long)(p_hi - p_lo));
+    fflush(stdout);
+
+    free(r2); free(r1);
+    ds4_gpu_tensor_free(pt2); ds4_gpu_tensor_free(pt1);
+    ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(o1);
+    ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(kc);
+    free(gh); free(qh); free(vch); free(kch);
+}
+
+/* Sparse regime control: with use_sel the host takes n_keys = sel_stride for
+ * every row, so the geometry is T-free and the two paths should agree. */
+static void probe_attn_sparse_align(uint32_t H, uint32_t Hkv, uint32_t D,
+                                    uint32_t p_lo, uint32_t p_hi, uint32_t sel_stride) {
+    const uint32_t cap = p_hi + 4u;
+    const float scale = 1.0f / sqrtf((float)D);
+    char env[32], name[160];
+    snprintf(env, sizeof(env), "%u", 32u);
+    setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", env, 1);
+    uint32_t ns = 0, kps = 0;
+    eq_attn_geom(sel_stride, 32u, &ns, &kps);
+
+    uint16_t *kch = malloc((uint64_t)cap * Hkv * D * 2u);
+    uint16_t *vch = malloc((uint64_t)cap * Hkv * D * 2u);
+    for (uint64_t i = 0; i < (uint64_t)cap * Hkv * D; i++) {
+        kch[i] = f32_to_f16(2.0f * frand() - 1.0f);
+        vch[i] = f32_to_f16(2.0f * frand() - 1.0f);
+    }
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    require_ok(kc && vc, "sparse align cache alloc");
+    require_ok(ds4_gpu_tensor_write(kc, 0, kch, (uint64_t)cap * Hkv * D * 2u), "sparse align k write");
+    require_ok(ds4_gpu_tensor_write(vc, 0, vch, (uint64_t)cap * Hkv * D * 2u), "sparse align v write");
+    float *qh = rand_vec((uint64_t)2 * H * D, 1.0f);
+    float *gh = rand_vec((uint64_t)2 * H * D, 0.5f);
+    ds4_gpu_tensor *gq = upload(qh, (uint64_t)2 * H * D);
+    ds4_gpu_tensor *gg = upload(gh, (uint64_t)2 * H * D);
+    ds4_gpu_tensor *o1 = upload(NULL, (uint64_t)H * D);
+    ds4_gpu_tensor *o2 = upload(NULL, (uint64_t)2 * H * D);
+    ds4_gpu_tensor *pt1 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1, H, D));
+    ds4_gpu_tensor *pt2 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(2, H, D));
+    /* identity selection of a fixed width: causally valid for any p >= width-1 */
+    int32_t *selh = malloc((uint64_t)2 * sel_stride * sizeof(int32_t));
+    uint32_t *nselh = calloc(2, sizeof(uint32_t));
+    for (uint32_t t = 0; t < 2; t++) {
+        for (uint32_t j = 0; j < sel_stride; j++) selh[(uint64_t)t * sel_stride + j] = (int32_t)j;
+        nselh[t] = sel_stride;
+    }
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)2 * sel_stride * 4u);
+    ds4_gpu_tensor *gnsel = ds4_gpu_tensor_alloc(8u);
+    require_ok(gsel && gnsel && pt1 && pt2, "sparse align allocs");
+    require_ok(ds4_gpu_tensor_write(gsel, 0, selh, (uint64_t)2 * sel_stride * 4u), "sparse sel write");
+    require_ok(ds4_gpu_tensor_write(gnsel, 0, nselh, 8u), "sparse nsel write");
+
+    float *r1 = malloc((uint64_t)H * D * sizeof(float));
+    float *r2 = malloc((uint64_t)H * D * sizeof(float));
+    eq_stats st;
+    snprintf(name, sizeof(name), "attention row0: T=1 vs T=2 row0, sparse (sel_stride=%u, %u keys, %u splits)",
+             sel_stride, sel_stride, ns);
+    eq_begin(&st, name);
+    for (uint32_t p = p_lo; p < p_hi; p++) {
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(o1, gq, gg, kc, vc, gsel, gnsel, pt1,
+                                                    1u, H, Hkv, D, p, true, sel_stride, scale), "sparse T=1");
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(o2, gq, gg, kc, vc, gsel, gnsel, pt2,
+                                                    2u, H, Hkv, D, p, true, sel_stride, scale), "sparse T=2");
+        require_ok(ds4_gpu_tensor_read(o1, 0, r1, (uint64_t)H * D * 4u), "sparse out1 read");
+        require_ok(ds4_gpu_tensor_read(o2, 0, r2, (uint64_t)H * D * 4u), "sparse out2 read");
+        eq_row(&st, r1, r2, (uint64_t)H * D);
+    }
+    eq_end(&st);
+
+    free(r2); free(r1);
+    free(nselh); free(selh);
+    ds4_gpu_tensor_free(gnsel); ds4_gpu_tensor_free(gsel);
+    ds4_gpu_tensor_free(pt2); ds4_gpu_tensor_free(pt1);
+    ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(o1);
+    ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(kc);
+    free(gh); free(qh); free(vch); free(kch);
+}
+
+/* ---- 2. hc_gate_mix: T=1 single-row kernel vs T=2 row 0 ---- */
+
+static uint64_t eq_w_row_bytes(uint32_t wtype, uint32_t cols) {
+    switch (wtype) {
+    case 0u:  return 4ull * cols;
+    case 1u:  case 30u: return 2ull * cols;
+    case 8u:  return (uint64_t)(cols / 32u) * 34u;
+    default:  return 0ull;
+    }
+}
+
+static uint64_t eq_w_alloc(arena_t *a, uint32_t wtype, uint32_t rows, uint32_t cols, double **shadow) {
+    switch (wtype) {
+    case 0u:  return arena_f32(a, (uint64_t)rows * cols, shadow, -0.05f, 0.05f);
+    case 1u:  return arena_f16(a, (uint64_t)rows * cols, shadow, 0.05f);
+    case 30u: return arena_bf16(a, (uint64_t)rows * cols, shadow, 0.05f);
+    case 8u:  return arena_q8_0(a, rows, cols, shadow, 0.05f);
+    default:  return 0ull;
+    }
+}
+
+static void probe_hc_mix_align(arena_t *a, uint32_t wtype) {
+    const uint32_t E = 2560u, hc = 4u, rank = 320u;
+    const uint64_t dim = (uint64_t)E * hc;
+    double *wsh = NULL;
+    const uint64_t woff = eq_w_alloc(a, wtype, (uint32_t)dim, rank, &wsh);
+    require_ok(woff != 0 && eq_w_row_bytes(wtype, rank) != 0, "hc align weight alloc");
+    float *xn = rand_vec((uint64_t)3 * dim, 0.6f);
+    float *lo = rand_vec((uint64_t)3 * rank, 1.0f);
+    ds4_gpu_tensor *gxn = upload(xn, (uint64_t)3 * dim);
+    ds4_gpu_tensor *glo = upload(lo, (uint64_t)3 * rank);
+    ds4_gpu_tensor *m1 = upload(NULL, E);
+    ds4_gpu_tensor *m2 = upload(NULL, (uint64_t)2 * E);
+    ds4_gpu_tensor *m3 = upload(NULL, (uint64_t)3 * E);
+    require_ok(m1 && m2 && m3, "hc align out alloc");
+    const char *tn = wtype == 1u ? "f16" : wtype == 30u ? "bf16" : wtype == 0u ? "f32" : "q8_0";
+    char name[160], name2[160];
+
+    float *r1 = download(m1, E);
+    for (int no_pair = 0; no_pair < 2; no_pair++) {
+        if (no_pair) setenv("DS4_QWEN4_NO_HC_PAIR", "1", 1);
+        else unsetenv("DS4_QWEN4_NO_HC_PAIR");
+        require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(m1, gxn, glo, a->base, a->size, woff,
+                                                    wtype, 1u, E, hc, rank), "hc mix T=1");
+        require_ok(ds4_gpu_tensor_read(m1, 0, r1, (uint64_t)E * 4u), "hc mix out1 read");
+        snprintf(name, sizeof(name), "hc_gate_mix %s row0: T=1 vs T=2%s", tn, no_pair ? " (NO_HC_PAIR)" : "");
+        {
+            eq_stats st;
+            eq_begin(&st, name);
+            float *r2 = download(m2, (uint64_t)2 * E);
+            require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(m2, gxn, glo, a->base, a->size, woff,
+                                                        wtype, 2u, E, hc, rank), "hc mix T=2");
+            require_ok(ds4_gpu_tensor_read(m2, 0, r2, (uint64_t)2 * E * 4u), "hc mix out2 read");
+            eq_row(&st, r1, r2, E);
+            free(r2);
+            eq_end(&st);
+        }
+        snprintf(name2, sizeof(name2), "hc_gate_mix %s row0: T=1 vs T=3%s", tn, no_pair ? " (NO_HC_PAIR)" : "");
+        {
+            eq_stats st;
+            eq_begin(&st, name2);
+            float *r3 = download(m3, (uint64_t)3 * E);
+            require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(m3, gxn, glo, a->base, a->size, woff,
+                                                        wtype, 3u, E, hc, rank), "hc mix T=3");
+            require_ok(ds4_gpu_tensor_read(m3, 0, r3, (uint64_t)3 * E * 4u), "hc mix out3 read");
+            eq_row(&st, r1, r3, E);
+            free(r3);
+            eq_end(&st);
+        }
+    }
+    unsetenv("DS4_QWEN4_NO_HC_PAIR");
+    /* the nsg axis must be free (the audit's class-A claim): same T=2 call at
+     * two threadgroup sizes must produce the same bytes. */
+    {
+        eq_stats st;
+        float *ra = download(m2, (uint64_t)2 * E);
+        require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(m2, gxn, glo, a->base, a->size, woff,
+                                                    wtype, 2u, E, hc, rank), "hc mix T=2 (nsg default)");
+        require_ok(ds4_gpu_tensor_read(m2, 0, ra, (uint64_t)2 * E * 4u), "hc mix nsg read a");
+        setenv("DS4_QWEN4_HC_PAIR_NSG", "1", 1);
+        setenv("DS4_QWEN4_HC_NSG", "1", 1);
+        require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(m2, gxn, glo, a->base, a->size, woff,
+                                                    wtype, 2u, E, hc, rank), "hc mix T=2 (nsg 1)");
+        float *rb = download(m2, (uint64_t)2 * E);
+        snprintf(name, sizeof(name), "hc_gate_mix %s nsg axis: pair nsg 1 vs default (T=2)", tn);
+        eq_begin(&st, name);
+        eq_row(&st, ra, rb, (uint64_t)2 * E);
+        eq_end(&st);
+        unsetenv("DS4_QWEN4_HC_PAIR_NSG");
+        unsetenv("DS4_QWEN4_HC_NSG");
+        free(rb); free(ra);
+    }
+    free(r1); free(wsh);
+    ds4_gpu_tensor_free(m3); ds4_gpu_tensor_free(m2); ds4_gpu_tensor_free(m1);
+    ds4_gpu_tensor_free(glo); ds4_gpu_tensor_free(gxn);
+    free(lo); free(xn);
+}
+
+/* ---- 3. multi_gemv: bundled vs standalone (the ksplit is chosen from the
+ *         bundle's total row count) ---- */
+
+static void probe_multi_gemv_bundle(arena_t *a) {
+    /* the live attention block's four fused projections (layer 3 of the pack) */
+    const uint32_t in_dim = 2560u;
+    const uint32_t rows[4] = { 512u, 512u, 512u, 128u };   /* total 1664 */
+    const uint32_t types[4] = { 30u, 30u, 30u, 30u };
+    double *sh[4];
+    uint64_t offs[4];
+    for (int i = 0; i < 4; i++) offs[i] = arena_bf16(a, (uint64_t)rows[i] * in_dim, &sh[i], 0.05f);
+    float *x = rand_vec((uint64_t)2 * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)2 * in_dim);
+    ds4_gpu_tensor *bundled[4], *single[4];
+    for (int i = 0; i < 4; i++) {
+        bundled[i] = upload(NULL, (uint64_t)2 * rows[i]);
+        single[i] = upload(NULL, (uint64_t)2 * rows[i]);
+    }
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, 2u, in_dim, 4, bundled, a->base, a->size,
+                                               offs, types, rows), "bundle gemv");
+    char name[160];
+    eq_stats st;
+    snprintf(name, sizeof(name), "multi_gemv bundle(total 1664) vs standalone per projection, T=2");
+    eq_begin(&st, name);
+    for (int i = 0; i < 4; i++) {
+        uint64_t o = offs[i];
+        uint32_t t = types[i], r = rows[i];
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, 2u, in_dim, 1, &single[i], a->base, a->size,
+                                                   &o, &t, &r), "standalone gemv");
+        float *b = download(bundled[i], (uint64_t)2 * rows[i]);
+        float *s = download(single[i], (uint64_t)2 * rows[i]);
+        eq_add(&st, b, s, (uint64_t)2 * rows[i]);
+        free(s); free(b);
+    }
+    st.pos_tested = 4; st.pos_differ = st.elem_differ ? 4 : 0;
+    eq_end(&st);
+
+    /* neutralised: force the whole-row walk in both */
+    setenv("DS4_QWEN4_GEMV_KSPLIT", "1", 1);
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, 2u, in_dim, 4, bundled, a->base, a->size,
+                                               offs, types, rows), "bundle gemv ksplit 1");
+    snprintf(name, sizeof(name), "multi_gemv bundle vs standalone, ksplit forced to 1");
+    eq_begin(&st, name);
+    for (int i = 0; i < 4; i++) {
+        uint64_t o = offs[i];
+        uint32_t t = types[i], r = rows[i];
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, 2u, in_dim, 1, &single[i], a->base, a->size,
+                                                   &o, &t, &r), "standalone gemv ksplit 1");
+        float *b = download(bundled[i], (uint64_t)2 * rows[i]);
+        float *s = download(single[i], (uint64_t)2 * rows[i]);
+        eq_add(&st, b, s, (uint64_t)2 * rows[i]);
+        free(s); free(b);
+    }
+    st.pos_tested = 4; st.pos_differ = st.elem_differ ? 4 : 0;
+    eq_end(&st);
+    unsetenv("DS4_QWEN4_GEMV_KSPLIT");
+
+    /* is the bundle T-dependent at all?  same call at T=1 vs T=2 */
+    ds4_gpu_tensor *t1[4];
+    for (int i = 0; i < 4; i++) t1[i] = upload(NULL, rows[i]);
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, 1u, in_dim, 4, t1, a->base, a->size,
+                                               offs, types, rows), "bundle gemv T=1");
+    snprintf(name, sizeof(name), "multi_gemv bundle row0: T=1 vs T=2 (same bundle, same ksplit)");
+    eq_begin(&st, name);
+    for (int i = 0; i < 4; i++) {
+        float *b2 = download(bundled[i], (uint64_t)2 * rows[i]);
+        float *b1 = download(t1[i], rows[i]);
+        eq_add(&st, b1, b2, rows[i]);
+        free(b1); free(b2);
+    }
+    st.pos_tested = 4; st.pos_differ = st.elem_differ ? 4 : 0;
+    eq_end(&st);
+
+    for (int i = 0; i < 4; i++) {
+        ds4_gpu_tensor_free(t1[i]);
+        ds4_gpu_tensor_free(single[i]);
+        ds4_gpu_tensor_free(bundled[i]);
+        free(sh[i]);
+    }
+    ds4_gpu_tensor_free(gx);
+    free(x);
+}
+
+/* ---- 4. GDN front (fused conv+norms, T=3 non-exact) vs conv_stream + gdn_prep ---- */
+
+static void probe_gdn_align(arena_t *a) {
+    const uint32_t Hk = 16u, Hv = 48u, D = 128u, K = 4u;
+    const uint32_t E = 2560u;
+    const uint32_t T = 3u;
+    const uint64_t C = (uint64_t)(2u * Hk + Hv) * D;      /* 10240 */
+    const uint64_t S = (uint64_t)(K - 1u) * C;
+    double *csh, *ash, *bsh, *sash, *dtsh;
+    const uint64_t conv_off = arena_f32(a, C * K, &csh, -0.5f, 0.5f);
+    const uint64_t alpha_off = arena_bf16(a, (uint64_t)Hv * E, &ash, 0.05f);
+    const uint64_t beta_off = arena_bf16(a, (uint64_t)Hv * E, &bsh, 0.05f);
+    const uint64_t ssm_a_off = arena_f32(a, Hv, &sash, -1.0f, -0.1f);
+    const uint64_t dt_off = arena_f32(a, Hv, &dtsh, -0.5f, 0.5f);
+    (void)csh; (void)ash; (void)bsh; (void)sash; (void)dtsh;
+
+    float *qraw = rand_vec((uint64_t)T * C, 1.0f);
+    float *st0 = rand_vec(S, 0.5f);
+    float *mixed = rand_vec((uint64_t)T * E, 1.0f);
+    ds4_gpu_tensor *qf = upload(qraw, (uint64_t)T * C);
+    ds4_gpu_tensor *qu = upload(qraw, (uint64_t)T * C);
+    ds4_gpu_tensor *sf = upload(st0, S);
+    ds4_gpu_tensor *su = upload(st0, S);
+    ds4_gpu_tensor *gmix = upload(mixed, (uint64_t)T * E);
+    ds4_gpu_tensor *gaf = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_tensor *gbf = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_tensor *gar = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_tensor *gbr = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_tensor *ga2 = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_tensor *gb2 = upload(NULL, (uint64_t)T * Hv);
+    require_ok(ds4_gpu_qwen4_gdn_front_tensor(qf, sf, gmix, gaf, gbf, a->base, a->size,
+                                              conv_off, alpha_off, beta_off, ssm_a_off, dt_off,
+                                              30u, T, Hk, Hv, D, K, E, NULL, 0u, NULL, 0u),
+               "gdn front");
+    /* unfused arm: the alpha/beta projections as the graph's standalone gemv
+     * computes them, then conv_stream + gdn_prep.  Both buffers are re-staged
+     * from the originals before every arm: conv_stream and gdn_prep both
+     * rewrite their inputs in place, so a second run on the same buffer would
+     * be comparing against already-conv'ed, already-normalised data. */
+    uint32_t t30 = 30u, r48 = Hv;
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gmix, T, E, 1, &gar, a->base, a->size,
+                                               &alpha_off, &t30, &r48), "gdn alpha gemv");
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gmix, T, E, 1, &gbr, a->base, a->size,
+                                               &beta_off, &t30, &r48), "gdn beta gemv");
+    require_ok(ds4_gpu_qwen4_conv_stream_tensor(qu, su, a->base, a->size, conv_off, T,
+                                                (uint32_t)C, K, true), "gdn conv stream");
+    require_ok(ds4_gpu_qwen4_gdn_prep_tensor(qu, gar, gbr, a->base, a->size, ssm_a_off, dt_off,
+                                             T, Hk, Hv, D), "gdn prep");
+
+    char name[160];
+    {
+        eq_stats st;
+        snprintf(name, sizeof(name), "gdn q/k rows (conv+silu+q/k norm), element-level: front vs conv+prep");
+        eq_begin(&st, name);
+        float *x1 = download(qf, (uint64_t)T * C);
+        float *x2 = download(qu, (uint64_t)T * C);
+        /* the q/k heads are the regrouped norm; the v rows are conv-only */
+        eq_add(&st, x1, x2, (uint64_t)T * 2u * Hk * D);
+        eq_end(&st);
+        snprintf(name, sizeof(name), "gdn v rows (conv only), element-level: front vs conv_stream");
+        eq_begin(&st, name);
+        eq_add(&st, x1 + (uint64_t)T * 2u * Hk * D, x2 + (uint64_t)T * 2u * Hk * D,
+               (uint64_t)T * Hv * D);
+        eq_end(&st);
+        free(x2); free(x1);
+    }
+    {
+        eq_stats st;
+        snprintf(name, sizeof(name), "gdn conv state, element-level: front vs conv_stream");
+        eq_begin(&st, name);
+        float *s1 = download(sf, S);
+        float *s2 = download(su, S);
+        eq_add(&st, s1, s2, S);
+        free(s2); free(s1);
+        eq_end(&st);
+    }
+    {
+        eq_stats st;
+        snprintf(name, sizeof(name), "gdn beta, element-level: front vs prep, ksplit=8 (default)");
+        eq_begin(&st, name);
+        float *g1 = download(gbf, (uint64_t)T * Hv);
+        float *g2 = download(gbr, (uint64_t)T * Hv);
+        eq_add(&st, g1, g2, (uint64_t)T * Hv);
+        free(g2); free(g1);
+        eq_end(&st);
+        snprintf(name, sizeof(name), "gdn decay, element-level: front vs prep, ksplit=8 (default)");
+        eq_begin(&st, name);
+        float *h1 = download(gaf, (uint64_t)T * Hv);
+        float *h2 = download(gar, (uint64_t)T * Hv);
+        eq_add(&st, h1, h2, (uint64_t)T * Hv);
+        free(h2); free(h1);
+        eq_end(&st);
+    }
+    /* isolate the alpha/beta k-split from the norm regrouping: with the walk
+     * forced whole-row the projections are the same function gdn_front calls */
+    setenv("DS4_QWEN4_GEMV_KSPLIT", "1", 1);
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gmix, T, E, 1, &ga2, a->base, a->size,
+                                               &alpha_off, &t30, &r48), "gdn alpha gemv k1");
+    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gmix, T, E, 1, &gb2, a->base, a->size,
+                                               &beta_off, &t30, &r48), "gdn beta gemv k1");
+    /* fresh staging again: qu/su already hold this arm's conv output */
+    require_ok(ds4_gpu_tensor_write(qu, 0, qraw, (uint64_t)T * C * 4u), "gdn qkv restage");
+    require_ok(ds4_gpu_tensor_write(su, 0, st0, S * 4u), "gdn state restage");
+    require_ok(ds4_gpu_qwen4_conv_stream_tensor(qu, su, a->base, a->size, conv_off, T,
+                                                (uint32_t)C, K, true), "gdn conv stream k1");
+    require_ok(ds4_gpu_qwen4_gdn_prep_tensor(qu, ga2, gb2, a->base, a->size, ssm_a_off, dt_off,
+                                             T, Hk, Hv, D), "gdn prep k1");
+    {
+        eq_stats st;
+        snprintf(name, sizeof(name), "gdn beta, element-level: front vs prep, ksplit=1 (norm-only)");
+        eq_begin(&st, name);
+        float *g1 = download(gbf, (uint64_t)T * Hv);
+        float *g2 = download(gb2, (uint64_t)T * Hv);
+        eq_add(&st, g1, g2, (uint64_t)T * Hv);
+        free(g2); free(g1);
+        eq_end(&st);
+    }
+    {
+        eq_stats st;
+        snprintf(name, sizeof(name), "gdn q/k rows, element-level: ksplit=1 (isolates the norm)");
+        eq_begin(&st, name);
+        float *x1 = download(qf, (uint64_t)T * C);
+        float *x2 = download(qu, (uint64_t)T * C);
+        eq_add(&st, x1, x2, (uint64_t)T * 2u * Hk * D);
+        free(x2); free(x1);
+        eq_end(&st);
+    }
+    unsetenv("DS4_QWEN4_GEMV_KSPLIT");
+
+    /* The conv value itself rounds differently between the two kernels (the
+     * fused one accumulates from device loads, conv_stream from registers, so
+     * the backend contracts a different number of the four taps).  A conv
+     * weight of w[K-1]=1 and w[<K-1]=0 makes acc == raw exactly in both, which
+     * leaves the q/k-norm regrouping as the only surviving difference. */
+    {
+        const uint64_t ident_off = arena_alloc(a, C * K * sizeof(float));
+        float *cw = (float *)(a->base + ident_off);
+        memset(cw, 0, C * K * sizeof(float));
+        for (uint64_t c = 0; c < C; c++) cw[c * K + (K - 1u)] = 1.0f;
+        require_ok(ds4_gpu_tensor_write(qf, 0, qraw, (uint64_t)T * C * 4u), "gdn ident restage f");
+        require_ok(ds4_gpu_tensor_write(qu, 0, qraw, (uint64_t)T * C * 4u), "gdn ident restage u");
+        require_ok(ds4_gpu_tensor_write(sf, 0, st0, S * 4u), "gdn ident state f");
+        require_ok(ds4_gpu_tensor_write(su, 0, st0, S * 4u), "gdn ident state u");
+        require_ok(ds4_gpu_qwen4_gdn_front_tensor(qf, sf, gmix, gaf, gbf, a->base, a->size,
+                                                  ident_off, alpha_off, beta_off, ssm_a_off, dt_off,
+                                                  30u, T, Hk, Hv, D, K, E, NULL, 0u, NULL, 0u),
+                   "gdn front identity conv");
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gmix, T, E, 1, &gar, a->base, a->size,
+                                                   &alpha_off, &t30, &r48), "gdn ident alpha");
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gmix, T, E, 1, &gbr, a->base, a->size,
+                                                   &beta_off, &t30, &r48), "gdn ident beta");
+        require_ok(ds4_gpu_qwen4_conv_stream_tensor(qu, su, a->base, a->size, ident_off, T,
+                                                    (uint32_t)C, K, true), "gdn ident conv");
+        require_ok(ds4_gpu_qwen4_gdn_prep_tensor(qu, gar, gbr, a->base, a->size, ssm_a_off, dt_off,
+                                                 T, Hk, Hv, D), "gdn ident prep");
+        eq_stats st;
+        snprintf(name, sizeof(name), "gdn q/k rows, identity conv: front vs conv+prep (norm only)");
+        eq_begin(&st, name);
+        float *x1 = download(qf, (uint64_t)T * C);
+        float *x2 = download(qu, (uint64_t)T * C);
+        eq_add(&st, x1, x2, (uint64_t)T * 2u * Hk * D);
+        eq_end(&st);
+        free(x2); free(x1);
+    }
+
+    ds4_gpu_tensor_free(gb2); ds4_gpu_tensor_free(ga2);
+    ds4_gpu_tensor_free(gbr); ds4_gpu_tensor_free(gar);
+    ds4_gpu_tensor_free(gbf); ds4_gpu_tensor_free(gaf);
+    ds4_gpu_tensor_free(gmix);
+    ds4_gpu_tensor_free(su); ds4_gpu_tensor_free(sf);
+    ds4_gpu_tensor_free(qu); ds4_gpu_tensor_free(qf);
+    free(mixed); free(st0); free(qraw);
+}
+
+/* ---- 5. multi-row walk: a T-row dispatch must reproduce the 1-row dispatch,
+ *         row for row, bit for bit ---- */
+
+/* The verify rows read each weight row once for all T tokens
+ * (DS4_QWEN4_GEMV_MULTIROW, kernel_qwen4_multi_gemv's multi_row branch).
+ * Two properties are pinned here, both exact and both on every wide walk the
+ * host admits (bf16, f16 and q8_0): (a) at T >= 2 the multi-row dispatch is
+ * bit-identical to the per-token grid it replaces, and (b) row t of a T-row
+ * dispatch is bit-identical to the 1-row dispatch of that same row, so the
+ * decode row's own rounding does not depend on the token count.  Both k-split
+ * policies are covered: the narrow 10240 -> 320 shape takes ksplit 8 (the
+ * slice-sum path through threadgroup memory) and 2560 -> 12288 takes ksplit 1
+ * (whole-row walk); the 6144 -> 2560 shape stages a prefix, so the walks'
+ * staged and device halves are both exercised. */
+static void probe_multi_gemv_multirow(arena_t *a) {
+    static const struct { uint32_t in_dim, rows; const char *role; } shapes[] = {
+        { 10240u,   320u, "hc_down ksplit8" },
+        {  2560u, 12288u, "attn_q ksplit1" },
+        {  6144u,  2560u, "ssm_out ksplit1, staged prefix" },
+    };
+    static const uint32_t wtypes[3] = { 30u, 1u, 8u };
+    static const char *wnames[3] = { "bf16", "f16", "q8_0" };
+    for (unsigned wi = 0; wi < 3u; wi++) {
+    for (unsigned si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        const uint32_t in_dim = shapes[si].in_dim, rows = shapes[si].rows;
+        double *sh;
+        const uint64_t off = wtypes[wi] == 30u ? arena_bf16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
+                            : wtypes[wi] == 1u ? arena_f16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
+                                               : arena_q8_0(a, rows, in_dim, &sh, 0.05f);
+        float *x = rand_vec(3ull * in_dim, 1.0f);
+        ds4_gpu_tensor *gx = upload(x, 3ull * in_dim);
+        /* One [3][rows] buffer per dispatch shape: the T-row call writes row t
+         * at t * rows, so both layouts are read back from the same place. */
+        ds4_gpu_tensor *mr = upload(NULL, 3ull * rows);
+        ds4_gpu_tensor *grid = upload(NULL, 3ull * rows);
+        ds4_gpu_tensor *one[3];
+        const uint32_t types[1] = { wtypes[wi] }, rws[1] = { rows };
+        const uint64_t offs[1] = { off };
+        for (int t = 0; t < 3; t++) one[t] = upload(NULL, rows);
+        for (uint32_t T = 2; T <= 3u; T++) {
+            ds4_gpu_tensor *outs[1];
+            setenv("DS4_QWEN4_GEMV_MULTIROW", "1", 1);
+            outs[0] = mr;
+            require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, in_dim, 1, outs, a->base, a->size, offs, types, rws),
+                       "multi-row gemv");
+            setenv("DS4_QWEN4_GEMV_MULTIROW", "0", 1);
+            outs[0] = grid;
+            require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, in_dim, 1, outs, a->base, a->size, offs, types, rws),
+                       "per-token gemv");
+            unsetenv("DS4_QWEN4_GEMV_MULTIROW");
+            /* (a) the two dispatches agree on every row of every token */
+            float *m = download(mr, 3ull * rows), *g = download(grid, 3ull * rows);
+            eq_stats st;
+            char name[128];
+            snprintf(name, sizeof(name), "%s %s T=%u: multi-row vs per-token grid", shapes[si].role,
+                     wnames[wi], T);
+            eq_begin(&st, name);
+            for (uint64_t i = 0; i < (uint64_t)T * rows; i++) eq_row(&st, m + i, g + i, 1);
+            eq_end(&st);
+            require_ok(st.elem_differ == 0 && st.elem_tested == (uint64_t)T * rows, name);
+            /* (b) each row of the T-row dispatch equals its own 1-row dispatch */
+            for (uint32_t t = 0; t < T; t++) {
+                ds4_gpu_tensor *gx1 = upload(x + (uint64_t)t * in_dim, in_dim);
+                outs[0] = one[t];
+                require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx1, 1, in_dim, 1, outs, a->base, a->size, offs, types, rws),
+                           "single-row gemv");
+                ds4_gpu_tensor_free(gx1);
+                float *o = download(one[t], rows);
+                snprintf(name, sizeof(name), "%s %s: T=%u row %u vs T=1", shapes[si].role, wnames[wi], T, t);
+                eq_begin(&st, name);
+                for (uint64_t i = 0; i < rows; i++) eq_row(&st, m + (uint64_t)t * rows + i, o + i, 1);
+                eq_end(&st);
+                require_ok(st.elem_differ == 0 && st.elem_tested == rows, name);
+                free(o);
+            }
+            free(g); free(m);
+        }
+        for (int t = 0; t < 3; t++) ds4_gpu_tensor_free(one[t]);
+        ds4_gpu_tensor_free(grid);
+        ds4_gpu_tensor_free(mr);
+        ds4_gpu_tensor_free(gx);
+        free(x); free(sh);
+    }
+    }
+}
+
+static void test_t_alignment(arena_t *a) {
+    printf("T=1 vs T>=2 numeric alignment\n");
+    printf("  (arena used before the probes: %llu MiB)\n", (unsigned long long)(a->used >> 20));
+    /* dense regime at the shipped 32 keys/split, in four consecutive bands so
+     * the divergence *frequency* is measured as a function of key count.
+     * H=24 / Hkv=2 / D=256 is the shipped attention shape (n_head/n_head_kv is
+     * exactly the 12 the kernel allows). */
+    probe_attn_t_align(24u, 2u, 256u, 24u, 288u, 32u);
+    probe_attn_t_align(24u, 2u, 256u, 288u, 800u, 32u);
+    probe_attn_t_align(24u, 2u, 256u, 800u, 1312u, 32u);
+    probe_attn_t_align(24u, 2u, 256u, 1312u, 1824u, 32u);
+    /* the isolating knob: one split for both rows (n_splits == 1 both ways) */
+    probe_attn_t_align(24u, 2u, 256u, 24u, 288u, 262144u);
+    probe_attn_t_align(24u, 2u, 256u, 800u, 1312u, 262144u);
+    /* sparse regime: the geometry is sel_stride for every row */
+    probe_attn_sparse_align(24u, 2u, 256u, 1000u, 1200u, 256u);
+    probe_attn_sparse_align(24u, 2u, 256u, 1000u, 1200u, 8192u);
+    for (uint32_t wt = 0; wt < 4u; wt++) {
+        static const uint32_t types[4] = { 1u, 30u, 0u, 8u };
+        probe_hc_mix_align(a, types[wt]);
+    }
+    probe_multi_gemv_bundle(a);
+    probe_multi_gemv_multirow(a);
+    probe_gdn_align(a);
+    printf("  (arena used after the probes: %llu MiB)\n", (unsigned long long)(a->used >> 20));
+}
+
+#endif  /* __APPLE__ */
+
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)1536 << 20;
+    /* The correctness tests use about 1 GiB of this mmap.  QWEN4_BENCH=1 adds
+     * the cold-read weight regions and the stream-ceiling span on top (see
+     * BENCH_BF16_REGION..BENCH_STREAM_MIB), which the rump of the bench list
+     * has already spent by then, so the map is sized for the sum. */
+    arena.size = (uint64_t)3072 << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -3658,8 +5162,9 @@ int main(void) {
     test_ple(&arena, 2560, 3);
     test_ple(&arena, 64, 12);
     printf("router\n");
-    test_router(&arena, 512, 10, 3);
-    test_router(&arena, 32, 10, 5);
+    test_router(&arena, 512, 10, 3, NULL, "");
+    test_router(&arena, 32, 10, 5, NULL, "");
+    test_router_ties(&arena);
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
@@ -3733,6 +5238,9 @@ int main(void) {
     test_mtp(&arena, 64, 4);
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
+#ifdef __APPLE__
+    test_t_alignment(&arena);
+#endif
     printf("all qwen4 kernel tests passed\n");
     return 0;
 }

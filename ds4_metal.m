@@ -48504,6 +48504,33 @@ int ds4_gpu_qwen4_decode_fusions_enabled(void) {
     return override >= 0 ? override : ds4_gpu_device_name_contains("M3 Ultra");
 }
 
+/* The grouped-norm family is a handful of threadgroups over a few hundred
+ * kilobytes. At the decode width (n_hc * 8 = 32 threadgroups) each row stream
+ * is cut into 320-element chunks, so 128 threads leave two elements per thread
+ * and the three barrier rounds set the pace: the pass is latency-bound, not
+ * byte-bound. Measured at the T=1 shape, 128 threads 15.0 us, 256 11.3, 512
+ * 9.3, 1024 12.1. Once the grid already fills the machine (any T > 2) the
+ * extra lanes idle in the chunk loop and cost instead of paying: the T=256
+ * shape goes 82.7 -> 160.4 us. The kernel takes its width from ntg.x, so this
+ * is a dispatch-structure choice, not a kernel one.
+ *
+ * The faster width is NOT the default: the RMS reduction runs over the whole
+ * row per threadgroup and its simdgroup count is the thread count, so a wider
+ * threadgroup re-associates that sum. At 512 threads the greedy token stream
+ * diverges from the 128-thread stream past ~100 tokens (measured: identical
+ * for 96, different at 200; verify acceptance 71.6% -> 76.1%, cycles 116 ->
+ * 113), which is the re-rounding signature the campaign had to discard once
+ * already. The decode path keeps the historical 128 threads; the switch
+ * exists so the trade can be re-measured deliberately. */
+#define QWEN4_HC_DECODE_THREADS 128u
+static NSUInteger qwen4_hc_threads(uint32_t n_tokens) {
+    /* Only the one- and two-row decode shapes: a wider prefill width
+     * re-rounds the prefill state, which moves the whole continuation and
+     * would hide the decode effect behind a different prompt. */
+    if (n_tokens > 2u) return 128u;
+    return (NSUInteger)ds4_gpu_env_u64("DS4_QWEN4_HC_THREADS", QWEN4_HC_DECODE_THREADS, 32u, 1024u);
+}
+
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
@@ -48541,7 +48568,7 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
     return qwen4_dispatch(weight_type == 30u ? QWEN4_K_HC_COMBINE_NORM_BF16 : QWEN4_K_HC_COMBINE_NORM,
         &args, sizeof(args), b, 8,
-        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
+        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(qwen4_hc_threads(n_tokens), 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_norm_tensor(
@@ -48590,7 +48617,7 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32,
                           QWEN4_K_HC_NORM_Q8, QWEN4_K_HC_NORM_BF16);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(qwen4_hc_threads(n_tokens), 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
@@ -48625,8 +48652,12 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
      * Keep the per-row lane mapping and reduction order unchanged. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
         ds4_gpu_device_name_contains("M3 Ultra") ? 16u : 4u;
+    /* Both paths' threadgroups per output column are live A/B switches: the
+     * bf16 rows are read-bound on bytes in flight per lane, which depends on
+     * the shape of the grid they are spread over. */
     const uint32_t nsg = pair ?
-        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u) : 4u;
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u)
+        : (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_NSG", 4u, 1u, 16u);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
                           MTLSizeMake((n_embd + nsg - 1u) / nsg, pair ? 1u : n_tokens, 1), MTLSizeMake(nsg * 32u, 1, 1),
                           pair ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
@@ -50215,7 +50246,7 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows) {
-    struct { uint32_t n_tokens, in_dim, n_out, pad0, rows[4], types[4], row_bytes[4], ksplit, pad1, pad2, pad3; } args = {0};
+    struct { uint32_t n_tokens, in_dim, n_out, multi_row, rows[4], types[4], row_bytes[4], ksplit, stage, stage_floats, pad3; } args = {0};
     qwen4_bind b[9];
     if (!x || n_tokens == 0 || in_dim == 0 || (in_dim % 32) != 0 || n_out == 0 || n_out > 4 ||
         !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * in_dim * sizeof(float), "multi gemv input")) {
@@ -50225,6 +50256,8 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
     args.in_dim = in_dim;
     args.n_out = n_out;
     uint32_t total = 0;
+    uint64_t weight_bytes = 0;
+    bool all_wide = true;
     for (uint32_t i = 0; i < 4; i++) {
         if (i < n_out) {
             const uint32_t rb = qwen4_expert_row_bytes(types[i], in_dim);
@@ -50239,6 +50272,8 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
             args.types[i] = types[i];
             args.row_bytes[i] = rb;
             total += out_rows[i];
+            weight_bytes += (uint64_t)rb * out_rows[i];
+            all_wide = all_wide && (types[i] == 30u || types[i] == 1u || types[i] == 8u);
         } else {
             b[1 + i] = b[1];
             b[5 + i] = b[5];
@@ -50246,23 +50281,114 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
     }
     /* A projection with few output rows launches too few threadgroups to fill
      * the machine, so its row walk runs at a fraction of the read bandwidth.
-     * Splitting k across the threadgroup's four SIMD groups multiplies the
+     * Splitting k across the threadgroup's SIMD groups multiplies the
      * parallelism; every row is still finished by exactly one threadgroup and
      * one fixed slice order, so the decode row and the two/three-row verify
      * rows of that row keep rounding identically.  The slice sum rounds
      * differently from the historical whole-row walk, so logits move by a few
-     * ULP; DS4_QWEN4_GEMV_KSPLIT=1 restores the old walk for A/B. */
-    const uint32_t ksplit_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_KSPLIT", 0u, 0u, 4u);
-    uint32_t ksplit = ksplit_env ? ksplit_env : (total < 1024u ? 4u : 1u);
-    if (ksplit > 4u) ksplit = 4u;
-    args.ksplit = ksplit;
-    const NSUInteger threads = 128u;
+     * ULP; DS4_QWEN4_GEMV_KSPLIT=1 restores the old walk for A/B.
+     *
+     * The rate tracks the warp count at this shape, so the narrow policy takes
+     * both levers: eight SIMD groups (256 threads) and up to eight k slices.
+     * Measured cold at 10240 -> 320 bf16, holding everything else equal:
+     * ksplit 1 (160 warps) 235 GB/s, 2 (320) 333, 4 (640) 393, 8 (1280) 414. */
+    const NSUInteger threads = 256u;
     const NSUInteger nsg = threads / 32u;
-    const NSUInteger tg_mem = (NSUInteger)(nsg * 2u * sizeof(float));
+    const uint32_t ksplit_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_KSPLIT", 0u, 0u, (uint64_t)nsg);
+    uint32_t ksplit = ksplit_env ? ksplit_env : (total < 1024u ? 8u : 1u);
+    if (ksplit > nsg) ksplit = (uint32_t)nsg;
+    args.ksplit = ksplit;
+    /* Verify rows (T = 2..4) read each weight row once for all T tokens: the
+     * bf16, f16 and q8_0 walks each keep T accumulators per lane and the
+     * dispatch drops grid.y, so the second and third rows cost their activation
+     * reads instead of a full re-read of the matrix (measured at 2560 ->
+     * 248320, the output head: us(T=2)/us(T=1) 2.00 -> 1.0x).  Row values are
+     * the single-row walk's to the bit, and only those three walks share the
+     * read, so the multi-row dispatch is taken only when every bound
+     * projection is one of them and the projection is wide enough for the
+     * k-split rule to have left it with the whole-row walk (ksplit 1): a narrow
+     * projection's threadgroups are already one row pair each, so it has no
+     * weight re-read to save and loses parallelism when the dispatch drops
+     * grid.y.
+     * DS4_QWEN4_GEMV_MULTIROW=0 keeps the per-token grid for A/B. */
+    const uint32_t multi_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_MULTIROW", 2u, 0u, 2u);
+    const bool multi_row = (multi_env == 2u ? all_wide : multi_env == 1u) &&
+                           n_tokens >= 2u && n_tokens <= 4u && ksplit <= 1u;
+    args.multi_row = multi_row ? 1u : 0u;
+    /* The activation rows are the other half of the verify row's cost: every
+     * weight-row walk also reads the T activation rows (4 B per element per
+     * token against the bf16 weight's 2 B), and a threadgroup owns
+     * rows_per_tg rows of the same activations.  Staging them once per
+     * threadgroup is what the pair kernel does at 320 -> 10240, and it is the
+     * difference between the second row costing an activation read per row and
+     * one per threadgroup.  Threadgroup memory is 32 KiB and shared with the
+     * k-split partials, so this is only for the widths that fit: at 2560 the
+     * full T = 2 and T = 3 rows fit with room to spare, 6144 fits as a prefix
+     * whose remaining pair-steps are read from device memory (the step order
+     * is the same either way).  A threadgroup only pays for staging when the
+     * dispatch is long enough to be read-bound rather than launch-bound: below
+     * a few MiB of weights the activation rows stay in L1 across a
+     * threadgroup's rows anyway (the narrow shapes launch under one
+     * threadgroup per core, so nothing evicts them), and there the staged copy
+     * is a latency bubble the dispatch cannot hide.
+     * DS4_QWEN4_GEMV_STAGE=<bytes> caps the staging footprint (0 disables it
+     * for A/B); the default is the whole 32 KiB the device allows. */
+    const uint32_t stage_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_STAGE", 32768u, 0u, 32768u);
+    const NSUInteger red_bytes = nsg * 2u * (multi_row ? 4u : 1u) * sizeof(float);
+    uint32_t stage_floats = 0;
+    if (multi_row && stage_env > red_bytes && (in_dim % 8u) == 0u && weight_bytes >= (8u << 20)) {
+        bool offsets_ok = true;
+        for (uint32_t i = 0; i < n_out; i++) offsets_ok = offsets_ok && (offsets[i] & 15u) == 0u;
+        uint64_t per_tok = (stage_env - red_bytes) / ((uint64_t)n_tokens * sizeof(float));
+        if (per_tok > in_dim) per_tok = in_dim;
+        per_tok &= ~3ull;                     /* whole float4 vectors, as the copy moves */
+        if ((per_tok >> 10) >= 1u && offsets_ok) stage_floats = (uint32_t)per_tok;
+    }
+    args.stage = stage_floats ? 1u : 0u;
+    args.stage_floats = stage_floats;
     const NSUInteger rows_per_tg = (nsg * 2u) / ksplit;
     return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
-                          MTLSizeMake(((NSUInteger)total + rows_per_tg - 1u) / rows_per_tg, n_tokens, 1),
-                          MTLSizeMake(threads, 1, 1), tg_mem);
+                          MTLSizeMake(((NSUInteger)total + rows_per_tg - 1u) / rows_per_tg,
+                                      multi_row ? 1u : n_tokens, 1),
+                          MTLSizeMake(threads, 1, 1),
+                          red_bytes + (NSUInteger)stage_floats * n_tokens * sizeof(float));
+}
+
+/* Benchmark-only DRAM read ceiling; see kernel_qwen4_stream_read_bench in
+ * metal/qwen4.metal and the declaration in ds4_gpu.h.  `threadgroups` is what
+ * the caller varies to show how much memory-level parallelism a kernel of that
+ * grid shape can reach; it does not change the bytes read. */
+int ds4_gpu_qwen4_stream_read_bench_tensor(
+        ds4_gpu_tensor *sink, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes, uint32_t threadgroups) {
+    if (!sink || bytes < 16u) return 0;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_qwen4_stream_read_bench");
+    if (!pipeline) return 0;
+
+    qwen4_bind b[2];
+    if (!qwen4_bind_weight(&b[0], model_map, model_size, offset, bytes, "bench stream range") ||
+        !qwen4_bind_tensor(&b[1], sink, sizeof(uint32_t), "bench stream sink")) {
+        return 0;
+    }
+    const uint64_t n_vec = bytes / 16u;
+    /* One uint4 per thread unless the caller asks for a narrower grid; the
+     * kernel's grid-stride loop then walks the same range at that occupancy. */
+    const uint64_t threads = threadgroups ? (uint64_t)threadgroups * 256u
+                                          : ((n_vec + 255u) / 256u) * 256u;
+    if (threads == 0 || threads > 0xffffffffull) return 0;
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:b[0].buf offset:b[0].off atIndex:0];
+    [enc setBuffer:b[1].buf offset:b[1].off atIndex:1];
+    [enc setBytes:&n_vec length:sizeof(n_vec) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(threads / 256u), 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "bench stream read");
 }
 
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
