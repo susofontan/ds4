@@ -3347,20 +3347,30 @@ static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
     ds4_gpu_tensor *outs[4];
     for (int i = 0; i < 4; i++) outs[i] = upload(NULL, (uint64_t)T * rows[i]);
-    require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, E, 4, outs, a->base, a->size, offs, types, rows), "multi gemv");
-    for (int i = 0; i < 4; i++) {
-        double *ref = malloc((uint64_t)T * rows[i] * sizeof(double));
-        for (uint32_t t = 0; t < T; t++)
-            for (uint32_t r = 0; r < rows[i]; r++) {
-                double acc = 0.0;
-                for (uint32_t k = 0; k < E; k++) acc += sh[i][(uint64_t)r * E + k] * x[(uint64_t)t * E + k];
-                ref[(uint64_t)t * rows[i] + r] = acc;
-            }
-        char name[96];
-        snprintf(name, sizeof(name), "multi gemv out%d type %u rows %u T=%u", i, types[i], rows[i], T);
-        check_tensor(name, outs[i], ref, (uint64_t)T * rows[i], 3e-5);
-        free(ref); free(sh[i]); ds4_gpu_tensor_free(outs[i]);
+    /* The host picks a k-split from the row count; force each value so the
+     * slice-sum path and the whole-row walk both meet the same reference.
+     * ksplit is a live control (like the other qwen4 A/B switches). */
+    const char *ks[] = { "1", "2", "4", NULL };
+    for (int k = 0; ks[k]; k++) {
+        setenv("DS4_QWEN4_GEMV_KSPLIT", ks[k], 1);
+        require_ok(ds4_gpu_qwen4_multi_gemv_tensor(gx, T, E, 4, outs, a->base, a->size, offs, types, rows), "multi gemv");
+        for (int i = 0; i < 4; i++) {
+            double *ref = malloc((uint64_t)T * rows[i] * sizeof(double));
+            for (uint32_t t = 0; t < T; t++)
+                for (uint32_t r = 0; r < rows[i]; r++) {
+                    double acc = 0.0;
+                    for (uint32_t kk = 0; kk < E; kk++) acc += sh[i][(uint64_t)r * E + kk] * x[(uint64_t)t * E + kk];
+                    ref[(uint64_t)t * rows[i] + r] = acc;
+                }
+            char name[96];
+            snprintf(name, sizeof(name), "multi gemv ksplit %s out%d type %u rows %u T=%u",
+                     ks[k], i, types[i], rows[i], T);
+            check_tensor(name, outs[i], ref, (uint64_t)T * rows[i], 3e-5);
+            free(ref);
+        }
     }
+    unsetenv("DS4_QWEN4_GEMV_KSPLIT");
+    for (int i = 0; i < 4; i++) { free(sh[i]); ds4_gpu_tensor_free(outs[i]); }
     ds4_gpu_tensor_free(gx); free(x);
 }
 

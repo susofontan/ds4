@@ -2620,14 +2620,21 @@ struct ds4_metal_args_qwen4_moe {
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
- * ix = block stride, it = element pair inside the block */
-static inline float qwen4_row_dot(device const char *row, device const float *x,
-                                  uint weight_type, uint in_dim, ushort tiisg) {
+ * ix = block stride, it = element pair inside the block.
+ *
+ * kslice/ktotal split the k range across ktotal cooperating SIMD groups
+ * (ktotal == 1 is the historical whole-row walk).  Every slice visits a
+ * disjoint, fixed subset of the k blocks and the caller adds the slice
+ * partials in slice order, so the result depends only on (row, kslice,
+ * ktotal) and rows stay independent of each other. */
+static inline float qwen4_row_dot_ks(device const char *row, device const float *x,
+                                     uint weight_type, uint in_dim, ushort tiisg,
+                                     uint kslice, uint ktotal) {
     float acc = 0.0f;
     if (weight_type == 8) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;
-        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+        for (uint ib = kslice * 4u + (uint)ix; ib < nb; ib += ktotal * 4u) {
             device const char *b = row + (uint64_t)ib * 34;
             device const float *y = x + ib * 32 + (uint)it * 2;
             const float d = (float)(*(device const half *)b);
@@ -2638,7 +2645,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
     } else if (weight_type == 39) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;
-        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+        for (uint ib = kslice * 4u + (uint)ix; ib < nb; ib += ktotal * 4u) {
             device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 17);
             device const float *y = x + ib * 32 + (uint)it * 2;
             const float d = ds4_metal_e8m0_to_f32(b[0]);
@@ -2651,7 +2658,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
     } else if (weight_type == 2) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;
-        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+        for (uint ib = kslice * 4u + (uint)ix; ib < nb; ib += ktotal * 4u) {
             device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 18);
             device const float *y = x + ib * 32 + (uint)it * 2;
             const float d = (float)(*(device const half *)b);
@@ -2664,7 +2671,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
          * lane owns 8 consecutive elements of every block: group = lane/4, l = (lane%4)*8 */
         const uint nb = in_dim / 256;
         const uint group = tiisg / 4, l = (tiisg % 4) * 8;
-        for (uint ib = 0; ib < nb; ib++) {
+        for (uint ib = kslice; ib < nb; ib += ktotal) {
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 144);
             const float d = (float)(*(device const half *)blk);
             const float dmin = (float)(*(device const half *)(blk + 2));
@@ -2684,7 +2691,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
         const uint nb = (in_dim + 255u) / 256u;
         const uint group = tiisg / 2, l = (tiisg % 2) * 8;
         const uint q_base = 32u * (group / 8u) + 16u * (group & 1u), shift = ((group / 2u) & 3u) * 2u;
-        for (uint ib = 0; ib < nb; ib++) {
+        for (uint ib = kslice; ib < nb; ib += ktotal) {
             /* Padded Q2_K down weights have no corresponding activation tail. */
             if (ib * 256u + group * 16u + l >= in_dim) continue;
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 84);
@@ -2701,7 +2708,7 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
          * scale per 32); lane owns one 8-value grid entry: sub-block = lane/4, entry = lane%4 */
         const uint nb = in_dim / 256;
         const uint ib32 = tiisg / 4, j = tiisg % 4;
-        for (uint ib = 0; ib < nb; ib++) {
+        for (uint ib = kslice; ib < nb; ib += ktotal) {
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 66);
             const float d = (float)(*(device const half *)blk);
             device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
@@ -2717,30 +2724,50 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
         }
     } else if (weight_type == 30) {
 #if QWEN4_HAS_BFLOAT
-        device const bfloat *w = (device const bfloat *)row;
-        for (uint i = tiisg * 4; i < in_dim; i += 128) {
-            acc += (float)w[i] * x[i] + (float)w[i + 1] * x[i + 1] +
-                   (float)w[i + 2] * x[i + 2] + (float)w[i + 3] * x[i + 3];
+        if ((((ulong)row | (ulong)x) & 15ul) == 0ul && (in_dim & 3u) == 0u) {
+            /* eight bf16 weights and eight f32 activations per vector step;
+             * the same four elements per lane in the same order as the
+             * scalar walk below, just fewer load instructions */
+            device const bfloat4 *w4 = (device const bfloat4 *)row;
+            device const float4 *x4 = (device const float4 *)x;
+            const uint n4 = in_dim >> 2;
+            for (uint i = kslice * 32u + tiisg; i < n4; i += ktotal * 32u) {
+                const bfloat4 wv = w4[i];
+                const float4 xv = x4[i];
+                acc += (float)wv.x * xv.x + (float)wv.y * xv.y + (float)wv.z * xv.z + (float)wv.w * xv.w;
+            }
+        } else {
+            device const bfloat *w = (device const bfloat *)row;
+            for (uint i = kslice * 128u + tiisg * 4; i < in_dim; i += ktotal * 128u) {
+                acc += (float)w[i] * x[i] + (float)w[i + 1] * x[i + 1] +
+                       (float)w[i + 2] * x[i + 2] + (float)w[i + 3] * x[i + 3];
+            }
         }
 #else
         device const ushort *w = (device const ushort *)row;
-        for (uint i = tiisg * 4; i < in_dim; i += 128) {
+        for (uint i = kslice * 128u + tiisg * 4; i < in_dim; i += ktotal * 128u) {
             acc += as_type<float>((uint)w[i] << 16) * x[i] + as_type<float>((uint)w[i + 1] << 16) * x[i + 1] +
                    as_type<float>((uint)w[i + 2] << 16) * x[i + 2] + as_type<float>((uint)w[i + 3] << 16) * x[i + 3];
         }
 #endif
     } else if (weight_type == 1) {
         device const half *w = (device const half *)row;
-        for (uint i = tiisg * 4; i < in_dim; i += 128) {
+        for (uint i = kslice * 128u + tiisg * 4; i < in_dim; i += ktotal * 128u) {
             acc += (float)w[i] * x[i] + (float)w[i + 1] * x[i + 1] + (float)w[i + 2] * x[i + 2] + (float)w[i + 3] * x[i + 3];
         }
     } else {
         device const float *w = (device const float *)row;
-        for (uint i = tiisg * 4; i < in_dim; i += 128) {
+        for (uint i = kslice * 128u + tiisg * 4; i < in_dim; i += ktotal * 128u) {
             acc += w[i] * x[i] + w[i + 1] * x[i + 1] + w[i + 2] * x[i + 2] + w[i + 3] * x[i + 3];
         }
     }
     return simd_sum(acc);
+}
+
+/* Whole-row dot: the kslice == 0, ktotal == 1 case of the split walk. */
+static inline float qwen4_row_dot(device const char *row, device const float *x,
+                                  uint weight_type, uint in_dim, ushort tiisg) {
+    return qwen4_row_dot_ks(row, x, weight_type, in_dim, tiisg, 0u, 1u);
 }
 
 /* --- small multi-output GEMV (rows via the generic row dot) ------------- */
@@ -2753,11 +2780,23 @@ struct ds4_metal_args_qwen4_gemv {
     uint32_t out_rows[4];
     uint32_t types[4];
     uint32_t row_bytes[4];
+    /* k slices cooperated on by the threadgroup's SIMD groups; 0/1 keeps the
+     * historical one-row-pair-per-simdgroup walk (four pairs per group) */
+    uint32_t ksplit;
+    uint32_t pad1;
+    uint32_t pad2;
+    uint32_t pad3;
 };
 
 /* Up to four projections of the same input in one dispatch (e.g. the
  * attention k/v/indexer-q/indexer-k rows); also the fallback for weight types
- * the tuned dense GEMV lacks (bf16).  One simdgroup per two rows. */
+ * the tuned dense GEMV lacks (bf16).  With ksplit == 1 one simdgroup owns two
+ * rows and walks all of k, four row pairs per threadgroup.  With ksplit > 1
+ * the threadgroup's four simdgroups instead split k on one row pair per
+ * ksplit groups, then add the slice partials in slice order through
+ * threadgroup memory: a narrow projection that would otherwise launch a
+ * handful of threadgroups gets ksplit times the parallelism, and every row
+ * is still produced by exactly one threadgroup. */
 kernel void kernel_qwen4_multi_gemv(
         constant ds4_metal_args_qwen4_gemv & args,
         device const float *x,          /* [T][in_dim] */
@@ -2769,21 +2808,58 @@ kernel void kernel_qwen4_multi_gemv(
         device float       *o1,
         device float       *o2,
         device float       *o3,
+        threadgroup float  *red [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
     const uint tok = tgpig.y;
     if (tok >= args.n_tokens) return;
     const uint total = args.out_rows[0] + args.out_rows[1] + args.out_rows[2] + args.out_rows[3];
     device const float *xt = x + (uint64_t)tok * args.in_dim;
-    const uint r0 = (tgpig.x * 4 + (uint)sgitg) * 2;
-    for (uint r = r0; r < r0 + 2 && r < total; r++) {
-        uint i = 0, local = r;
-        while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
-        device const char *w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;
-        device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
-        const float v = qwen4_row_dot(w + (uint64_t)local * args.row_bytes[i], xt, args.types[i], args.in_dim, tiisg);
-        if (tiisg == 0) o[(uint64_t)tok * args.out_rows[i] + local] = v;
+    const uint nsg = ntg.x / 32u;
+    const uint ktotal = (args.ksplit && args.ksplit <= nsg) ? args.ksplit : 1u;
+    if (ktotal <= 1u) {
+        const uint r0 = (tgpig.x * nsg + (uint)sgitg) * 2;
+        for (uint r = r0; r < r0 + 2 && r < total; r++) {
+            uint i = 0, local = r;
+            while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
+            device const char *w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;
+            device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
+            const float v = qwen4_row_dot(w + (uint64_t)local * args.row_bytes[i], xt, args.types[i], args.in_dim, tiisg);
+            if (tiisg == 0) o[(uint64_t)tok * args.out_rows[i] + local] = v;
+        }
+        return;
+    }
+    /* ksplit groups per row pair, one row pair per group of ktotal simdgroups */
+    const uint per = nsg / ktotal;               /* row pairs handled per threadgroup */
+    const uint ks = (uint)sgitg % ktotal;        /* this simdgroup's k slice */
+    const uint rs = (uint)sgitg / ktotal;        /* row pair inside the threadgroup */
+    const uint rpair = tgpig.x * per + rs;
+    for (uint j = 0; j < 2; j++) {
+        const uint r = rpair * 2u + j;
+        float v = 0.0f;
+        if (r < total) {
+            uint i = 0, local = r;
+            while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
+            device const char *w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;
+            v = qwen4_row_dot_ks(w + (uint64_t)local * args.row_bytes[i], xt, args.types[i], args.in_dim, tiisg, ks, ktotal);
+        }
+        /* qwen4_row_dot_ks already returns the SIMD-group sum of this k slice */
+        if (tiisg == 0) red[(uint)sgitg * 2u + j] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0u && tiisg == 0u) {
+        for (uint j = 0; j < 2; j++) {
+            const uint r = rpair * 2u + j;
+            if (r >= total) break;
+            float s = 0.0f;
+            uint i = 0, local = r;
+            while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
+            device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
+            for (uint g = 0; g < ktotal; g++) s += red[(rs * ktotal + g) * 2u + j];
+            o[(uint64_t)tok * args.out_rows[i] + local] = s;
+        }
     }
 }
 

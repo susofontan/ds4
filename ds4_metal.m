@@ -50215,7 +50215,7 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows) {
-    struct { uint32_t n_tokens, in_dim, n_out, pad0, rows[4], types[4], row_bytes[4]; } args = {0};
+    struct { uint32_t n_tokens, in_dim, n_out, pad0, rows[4], types[4], row_bytes[4], ksplit, pad1, pad2, pad3; } args = {0};
     qwen4_bind b[9];
     if (!x || n_tokens == 0 || in_dim == 0 || (in_dim % 32) != 0 || n_out == 0 || n_out > 4 ||
         !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * in_dim * sizeof(float), "multi gemv input")) {
@@ -50244,8 +50244,25 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
             b[5 + i] = b[5];
         }
     }
+    /* A projection with few output rows launches too few threadgroups to fill
+     * the machine, so its row walk runs at a fraction of the read bandwidth.
+     * Splitting k across the threadgroup's four SIMD groups multiplies the
+     * parallelism; every row is still finished by exactly one threadgroup and
+     * one fixed slice order, so the decode row and the two/three-row verify
+     * rows of that row keep rounding identically.  The slice sum rounds
+     * differently from the historical whole-row walk, so logits move by a few
+     * ULP; DS4_QWEN4_GEMV_KSPLIT=1 restores the old walk for A/B. */
+    const uint32_t ksplit_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_KSPLIT", 0u, 0u, 4u);
+    uint32_t ksplit = ksplit_env ? ksplit_env : (total < 1024u ? 4u : 1u);
+    if (ksplit > 4u) ksplit = 4u;
+    args.ksplit = ksplit;
+    const NSUInteger threads = 128u;
+    const NSUInteger nsg = threads / 32u;
+    const NSUInteger tg_mem = (NSUInteger)(nsg * 2u * sizeof(float));
+    const NSUInteger rows_per_tg = (nsg * 2u) / ksplit;
     return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
-                          MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(((NSUInteger)total + rows_per_tg - 1u) / rows_per_tg, n_tokens, 1),
+                          MTLSizeMake(threads, 1, 1), tg_mem);
 }
 
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
