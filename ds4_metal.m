@@ -48161,6 +48161,9 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NAXC64,
     QWEN4_K_ROWS_F32_TO_F16,
     QWEN4_K_DENSE_MM,
+    QWEN4_K_DENSE_MM_BF16,
+    QWEN4_K_DENSE_MM_BF16_K64,
+    QWEN4_K_DENSE_MM_BF16_K64T64,
     QWEN4_K_DENSE_MM_REDUCE,
     QWEN4_K_BATCH_MM_Q8_T1,
     QWEN4_K_BATCH_MM_Q8_T2,
@@ -48272,6 +48275,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_naxc64",
     "kernel_qwen4_rows_f32_to_f16",
     "kernel_qwen4_dense_mm",
+    "kernel_qwen4_dense_mm_bf16",
+    "kernel_qwen4_dense_mm_bf16_k64",
+    "kernel_qwen4_dense_mm_bf16_k64t64",
     "kernel_qwen4_dense_mm_reduce",
     "kernel_qwen4_batch_mm_q8_t1",
     "kernel_qwen4_batch_mm_q8_t2",
@@ -50449,7 +50455,28 @@ int ds4_gpu_qwen4_dense_mm_tensor(
      * The split is chosen so the partials stay small and every threadgroup
      * still walks enough k to amortize its staging. */
     const uint32_t tiles = (out_rows + 31u) / 32u;
-    const uint32_t threadgroups = tiles * ((n_tokens + 31u) / 32u);
+    /* A bf16 weight matrix (the BF16-spine pack's dense projections) runs the
+     * bf16-operand MMA: staged bf16 tiles and simdgroup_bfloat8x8 with fp32
+     * accumulators, which this GPU issues at about 1.6x the fp32 simdgroup
+     * rate and which halves the staged bytes.  The other weight types keep
+     * the fp32 staging kernel and their existing rounding.
+     * DS4_QWEN4_DENSE_MM_BF16 picks the tile: 0 leaves bf16 on the fp32
+     * kernel, 1 is the 32x32x32 reference tile, 2 deepens k to 64, 3 deepens
+     * both k and the token tile to 64. */
+    int dense_kernel = QWEN4_K_DENSE_MM;
+    uint32_t tok_tile = 32u;
+    if (weight_type == 30u) {
+        const uint64_t bf16_tile = ds4_gpu_env_u64("DS4_QWEN4_DENSE_MM_BF16", 1u, 0u, 3u);
+        if (bf16_tile == 1u) {
+            dense_kernel = QWEN4_K_DENSE_MM_BF16;
+        } else if (bf16_tile == 2u) {
+            dense_kernel = QWEN4_K_DENSE_MM_BF16_K64;
+        } else if (bf16_tile == 3u) {
+            dense_kernel = QWEN4_K_DENSE_MM_BF16_K64T64;
+            tok_tile = 64u;
+        }
+    }
+    const uint32_t threadgroups = tiles * ((n_tokens + tok_tile - 1u) / tok_tile);
     uint32_t n_split = 1u;
     if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
         const uint32_t nk = (in_dim + 31u) / 32u;
@@ -50460,8 +50487,9 @@ int ds4_gpu_qwen4_dense_mm_tensor(
     }
     args.n_split = n_split;
     if (n_split <= 1u) {
-        return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
-                              MTLSizeMake(tiles, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);
+        return qwen4_dispatch(dense_kernel, &args, sizeof(args), b, 3,
+                              MTLSizeMake(tiles, (n_tokens + tok_tile - 1u) / tok_tile, 1),
+                              MTLSizeMake(128, 1, 1), 0);
     }
 
     const uint64_t plane = (uint64_t)n_tokens * out_rows * sizeof(float);
@@ -50472,8 +50500,9 @@ int ds4_gpu_qwen4_dense_mm_tensor(
     if (!qwen4_bind_tensor(&bp[2], g_qwen4_dense_mm_partials, plane * n_split, "dense mm partials")) {
         return 0;
     }
-    if (!qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), bp, 3,
-                        MTLSizeMake(tiles, (n_tokens + 31) / 32, n_split), MTLSizeMake(128, 1, 1), 0)) {
+    if (!qwen4_dispatch(dense_kernel, &args, sizeof(args), bp, 3,
+                        MTLSizeMake(tiles, (n_tokens + tok_tile - 1u) / tok_tile, n_split),
+                        MTLSizeMake(128, 1, 1), 0)) {
         return 0;
     }
     qwen4_bind br[2];

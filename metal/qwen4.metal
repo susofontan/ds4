@@ -5323,6 +5323,153 @@ kernel void kernel_qwen4_dense_mm(
     }
 }
 
+/* --- bf16-operand tiled GEMM -------------------------------------------
+ *
+ * Same tile and grid as kernel_qwen4_dense_mm, but the staged A (weights)
+ * and B (activations) tiles are bf16 and the product runs on
+ * simdgroup_bfloat8x8 with fp32 accumulators, which this GPU executes at
+ * about 1.6x the fp32 simdgroup rate (measured issue-bound, 16.3 vs 9.9
+ * TFLOP/s).  Halving the staged element width also halves the threadgroup
+ * bytes every tile moves, which is what buys the deeper KT k-tile.  Weights
+ * in a bf16 pack are bf16 already, so the only rounding this adds is the
+ * activation's: x is rounded to bf16 before the product.  The partial-plane
+ * layout is kernel_qwen4_dense_mm's, so kernel_qwen4_dense_mm_reduce sums
+ * the k-split planes unchanged.
+ *
+ * KT = staged k depth, TT = token tile (both multiples of the 8-wide MMA). */
+#define QWEN4_DM_BF16_MAX_KT 64
+
+/* 8 consecutive weights of row `row` from element k0 (k0 % 8 == 0), staged as
+ * bf16; the same contract as qwen4_dm_stage8 above. */
+static inline void qwen4_dm_stage8_bf16(device const char *row, uint k0, uint k_end, uint type,
+                                        threadgroup bfloat *dst) {
+    if (type == 30) {
+        /* bf16 weights: one 16-byte vector load per row */
+        if (k0 + 8u <= k_end) {
+            device const bfloat4 *src = (device const bfloat4 *)(row + (uint64_t)k0 * 2u);
+            *(threadgroup bfloat4 *)dst = src[0];
+            *(threadgroup bfloat4 *)(dst + 4) = src[1];
+            return;
+        }
+        for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? (bfloat)qwen4_vec_at(row, k0 + i, 30u) : bfloat(0.0f);
+    } else if (type == 8) {
+        qwen4_mm_stage8<bfloat>(row, k0 / 32, (k0 % 32) / 8, 8u, dst);
+    } else if (type == 1) {
+        device const half *w = (device const half *)row + k0;
+        for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? (bfloat)(float)w[i] : bfloat(0.0f);
+    } else {
+        device const float *w = (device const float *)row + k0;
+        for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? (bfloat)w[i] : bfloat(0.0f);
+    }
+}
+
+template <uint KT, uint TT>
+kernel void kernel_qwen4_dense_mm_bf16_t(
+        constant ds4_metal_args_qwen4_dense_mm & args,
+        device const char  *w,          /* [out_rows] rows */
+        device const float *x,          /* [T][in_dim] */
+        device float       *out,        /* [n_split or 1][T][out_rows] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint NT = TT / 8u;                  /* token tiles of 8 */
+    constexpr uint NQ = 128u / TT;                /* k writers per token */
+    constexpr uint KP = KT / NQ;                  /* k values per thread */
+    const uint row0 = tgpig.x * QWEN4_MM_ROWS;
+    const uint t0 = tgpig.y * TT;
+    if (row0 >= args.out_rows || t0 >= args.n_tokens) return;
+    threadgroup bfloat As[QWEN4_MM_ROWS * KT];
+    threadgroup bfloat Bs[KT * TT];
+    threadgroup float Cs[4][NT][64];
+    /* every matrix index below is a compile-time constant: a dynamically
+     * indexed simdgroup matrix leaves the registers */
+    simdgroup_float8x8 C[NT];
+#pragma unroll
+    for (uint j = 0; j < NT; j++) C[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint nk = (args.in_dim + KT - 1u) / KT;
+    /* A narrow projection gives this kernel only a handful of threadgroups,
+     * each walking every k-block in turn; splitting k spreads that walk over
+     * the machine instead. */
+    const uint nsplit = args.n_split ? args.n_split : 1u;
+    const uint kb_lo = (uint)(((uint64_t)tgpig.z * nk) / nsplit);
+    const uint kb_hi = (uint)(((uint64_t)(tgpig.z + 1u) * nk) / nsplit);
+    for (uint kb = kb_lo; kb < kb_hi; kb++) {
+        {
+            /* A: 32 rows x KT k, thread = (row, 8 k values) x (KT/32) steps */
+            const uint r = tid / 4, q = tid % 4;
+            const bool a_row = row0 + r < args.out_rows;
+            device const char *arow = w + (uint64_t)(a_row ? row0 + r : row0) * args.row_bytes;
+            for (uint s = q; s < KT / 8u; s += 4) {
+                threadgroup bfloat *dst = As + r * KT + s * 8;
+                if (a_row) {
+                    qwen4_dm_stage8_bf16(arow, kb * KT + s * 8, args.in_dim, args.weight_type, dst);
+                } else {
+                    for (uint i = 0; i < 8; i++) dst[i] = bfloat(0.0f);
+                }
+            }
+        }
+        {
+            /* B: KT k x TT tokens, thread = (token, KP k values) */
+            const uint tok = tid % TT, kq = tid / TT;
+            const uint t = t0 + tok;
+            const bool b_row = t < args.n_tokens;
+            device const float *xr = x + (uint64_t)(b_row ? t : 0u) * args.in_dim;
+            const uint kk0 = kb * KT + kq * KP;
+            threadgroup bfloat *bdst = Bs + kq * KP * TT + tok;
+            uint j = 0;
+            /* activations arrive fp32; the rows are 32-float aligned so the
+             * common case moves them four at a time */
+            for (; j + 4u <= KP && kk0 + j + 4u <= args.in_dim; j += 4u) {
+                const float4 v = b_row ? *(device const float4 *)(xr + kk0 + j) : float4(0.0f);
+                bdst[(j + 0u) * TT] = (bfloat)v.x;
+                bdst[(j + 1u) * TT] = (bfloat)v.y;
+                bdst[(j + 2u) * TT] = (bfloat)v.z;
+                bdst[(j + 3u) * TT] = (bfloat)v.w;
+            }
+            for (; j < KP; j++) {
+                bdst[j * TT] = (b_row && kk0 + j < args.in_dim) ? (bfloat)xr[kk0 + j] : bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint sub = 0; sub < KT / 8u; sub++) {
+            simdgroup_bfloat8x8 a;
+            simdgroup_load(a, As + (sgitg * 8) * KT + sub * 8, KT, 0, false);
+#pragma unroll
+            for (uint j = 0; j < NT; j++) {
+                simdgroup_bfloat8x8 b;
+                simdgroup_load(b, Bs + sub * 8 * TT + j * 8, TT, 0, false);
+                simdgroup_multiply_accumulate(C[j], a, b, C[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (uint j = 0; j < NT; j++) simdgroup_store(C[j], Cs[sgitg][j], 8, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < 4u * NT * 64u; idx += 128) {
+        const uint sg = idx / (NT * 64u), rem = idx % (NT * 64u), j = rem / 64u, el = rem % 64u;
+        const uint row = row0 + sg * 8u + el / 8u;
+        const uint t = t0 + j * 8u + el % 8u;
+        if (row < args.out_rows && t < args.n_tokens) {
+            out[(uint64_t)tgpig.z * args.n_tokens * args.out_rows +
+                (uint64_t)t * args.out_rows + row] = Cs[sg][j][el];
+        }
+    }
+}
+
+template [[host_name("kernel_qwen4_dense_mm_bf16")]]
+kernel void kernel_qwen4_dense_mm_bf16_t<32, 32>(
+        constant ds4_metal_args_qwen4_dense_mm &, device const char *, device const float *, device float *,
+        uint3, ushort, ushort);
+template [[host_name("kernel_qwen4_dense_mm_bf16_k64")]]
+kernel void kernel_qwen4_dense_mm_bf16_t<64, 32>(
+        constant ds4_metal_args_qwen4_dense_mm &, device const char *, device const float *, device float *,
+        uint3, ushort, ushort);
+template [[host_name("kernel_qwen4_dense_mm_bf16_k64t64")]]
+kernel void kernel_qwen4_dense_mm_bf16_t<64, 64>(
+        constant ds4_metal_args_qwen4_dense_mm &, device const char *, device const float *, device float *,
+        uint3, ushort, ushort);
+
 /* Sum the k-split planes written above. */
 kernel void kernel_qwen4_dense_mm_reduce(
         constant ds4_metal_args_qwen4_dense_mm & args,

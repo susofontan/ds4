@@ -4216,6 +4216,29 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
     ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
+static uint64_t test_env_u64(const char *name, uint64_t fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v) return fallback;
+    char *end = NULL;
+    const unsigned long long parsed = strtoull(v, &end, 10);
+    if (end == v || *end) return fallback;
+    return (uint64_t)parsed;
+}
+
+/* Round a float to bf16 and back, round-to-nearest-even -- the conversion the
+ * bf16 dense kernel's activation staging performs (see
+ * kernel_qwen4_dense_mm_bf16_t in metal/qwen4.metal).  The exponent of a
+ * finite float is kept, so this is the only rounding that path adds. */
+static float f32_to_bf16_rne(float v) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    if ((u & 0x7F800000u) != 0x7F800000u) {   /* not inf/nan */
+        u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+    }
+    memcpy(&v, &u, 4);
+    return v;
+}
+
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
@@ -4224,11 +4247,26 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
                                : arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
     double *ref = malloc((uint64_t)T * rows * sizeof(double));
+    /* A bf16 weight matrix runs the bf16-operand kernel, which stages the
+     * activations through bf16: its exact oracle is the product against
+     * bf16-rounded activations, and the fp32-activation product is computed
+     * beside it to report how far that rounding moves the result.  Every
+     * other weight type stages fp32 and meets the fp32 oracle exactly --
+     * including bf16 weights when DS4_QWEN4_DENSE_MM_BF16=0 selects the old
+     * fp32-staging kernel, which is the A/B the knob exists for. */
+    const bool bf16_ops = wtype == 30u && test_env_u64("DS4_QWEN4_DENSE_MM_BF16", 1u) != 0u;
+    double *ref_other = malloc((uint64_t)T * rows * sizeof(double));
     for (uint32_t t = 0; t < T; t++)
         for (uint32_t r = 0; r < rows; r++) {
-            double acc = 0.0;
-            for (uint32_t k = 0; k < in_dim; k++) acc += sh[(uint64_t)r * in_dim + k] * x[(uint64_t)t * in_dim + k];
+            double acc = 0.0, acc_f32 = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                const double w = sh[(uint64_t)r * in_dim + k];
+                const float xv = x[(uint64_t)t * in_dim + k];
+                acc += w * (double)(bf16_ops ? f32_to_bf16_rne(xv) : xv);
+                acc_f32 += w * (double)xv;
+            }
             ref[(uint64_t)t * rows + r] = acc;
+            ref_other[(uint64_t)t * rows + r] = bf16_ops ? acc_f32 : acc;
         }
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
     ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * rows);
@@ -4236,6 +4274,19 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     char name[96];
     snprintf(name, sizeof(name), "dense mm type %u %ux%u T=%u", wtype, rows, in_dim, T);
     check_tensor(name, gout, ref, (uint64_t)T * rows, 3e-5);
+    if (bf16_ops) {
+        float *got = download(gout, (uint64_t)T * rows);
+        double worst = 0.0, scale = 1e-6;
+        for (uint64_t i = 0; i < (uint64_t)T * rows; i++) {
+            const double d = fabs((double)got[i] - ref_other[i]);
+            if (d > worst) worst = d;
+            if (fabs(ref_other[i]) > scale) scale = fabs(ref_other[i]);
+        }
+        printf("  %-44s bf16 activation rounding moved it %.3e (rel %.3e)\n",
+               "dense mm type 30 vs fp32 activations", worst, worst / scale);
+        free(got);
+    }
+    free(ref_other);
     free(ref); free(x); free(sh);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
