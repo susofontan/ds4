@@ -1346,8 +1346,39 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+/* DS4_METAL_GPUSPAN=1 accounting, read by ds4.c's DS4_QWEN4_TIMING print. */
+static double ds4_gpu_now_ms(void);
+static double g_gpu_span_ms;
+static double g_gpu_span_wait_ms;
+static uint64_t g_gpu_span_cbs;
+
+void ds4_gpu_span_stats(double *gpu_ms, double *wait_ms, uint64_t *cbs) {
+    if (gpu_ms) *gpu_ms = g_gpu_span_ms;
+    if (wait_ms) *wait_ms = g_gpu_span_wait_ms;
+    if (cbs) *cbs = g_gpu_span_cbs;
+}
+
+/* Submit everything encoded so far and open a fresh batch, without waiting:
+ * the caller does host work that must overlap this submission (ds4.c's
+ * deferred PLE n-gram gather) and then calls ds4_gpu_end_commands(), which
+ * commits the fresh (empty) batch and waits for both. */
+int ds4_gpu_commit_batch(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 1;
+    return ds4_gpu_flush_commands();
+}
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    static int span_on = -1;
+    if (span_on < 0) span_on = getenv("DS4_METAL_GPUSPAN") != NULL;
+    const double span_t0 = span_on ? ds4_gpu_now_ms() : 0.0;
     [cb waitUntilCompleted];
+    if (span_on) {
+        const double busy = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+        if (busy > 0.0) g_gpu_span_ms += busy;
+        g_gpu_span_wait_ms += ds4_gpu_now_ms() - span_t0;
+        g_gpu_span_cbs++;
+    }
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
