@@ -32,6 +32,7 @@ from qwen4_pack import (
     Q2_PROFILE,
     Q2_STATE_NAME,
     Q2_VISION_NAME,
+    Q2BF16_PROFILE,
     PLE_AUX_NAMES,
     PLE_NAME,
     PleGGUFWriter,
@@ -799,6 +800,90 @@ class Qwen4PackTests(unittest.TestCase):
             self.assertEqual(action.kind, "copy")
             self.assertIsNone(action.qtype)
             self.assertEqual(action.specs[0].dtype, "BF16")
+
+    def test_q2bf16_writes_the_whole_spine_as_bf16(self):
+        projections = {
+            "model.language_model.layers.3.self_attn.q_proj.weight": "qsa",
+            "model.language_model.layers.2.linear_attn.out_proj.weight":
+                "gdn",
+            "model.language_model.layers.1.mlp.shared_expert.up_proj.weight":
+                "shared_expert",
+            "model.language_model.layers.1.ple.proj.weight":
+                "ple_projection",
+            "lm_head.weight": "output",
+            "model.visual.blocks.0.attn.proj.weight": "vision_projection",
+        }
+        tensors = {name: info("BF16", (32, 32)) for name in projections}
+        db = FakeDB(tensors)
+        for name, role in projections.items():
+            action = make_action(db, name, Q2BF16_PROFILE)
+            self.assertEqual((action.kind, action.qtype, action.role),
+                             ("copy", None, role))
+            self.assertEqual(action.specs[0].dtype, "BF16")
+            self.assertEqual(action.specs[0].shape, (32, 32))
+        # The routed experts keep the calibrated Q2 recipe.
+        gate = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        down = "model.language_model.layers.0.mlp.experts.down_proj"
+        expert_db = FakeDB({
+            gate: info("BF16", (512, 1280, 2560)),
+            down: info("BF16", (512, 2560, 640)),
+        })
+        gate_action = make_action(expert_db, gate, Q2BF16_PROFILE)
+        down_action = make_action(expert_db, down, Q2BF16_PROFILE)
+        self.assertEqual(gate_action.qtype, "IQ2_XXS")
+        self.assertEqual(down_action.qtype, "Q2_K")
+
+    def test_q2bf16_visual_fc2_keeps_padded_width_in_bf16(self):
+        name = "model.visual.blocks.0.mlp.linear_fc2.weight"
+        values = f32_to_bf16(
+            np.linspace(-1.0, 1.0, 2 * 4304, dtype=np.float32).reshape(2, 4304)
+        )
+        db = FakeDB(
+            {name: info("BF16", (1152, 4304))},
+            {name: values},
+        )
+        action = make_action(db, name, Q2BF16_PROFILE)
+        spec = action.specs[0]
+        self.assertEqual((action.kind, action.qtype), ("copy", None))
+        self.assertEqual(action.pad_last_to, 4320)
+        self.assertEqual(spec.dtype, "BF16")
+        self.assertEqual(spec.logical_shape, (1152, 4304))
+        self.assertEqual(spec.shape, (1152, 4320))
+        expected = np.ascontiguousarray(
+            np.pad(values, ((0, 0), (0, 16)))
+        ).tobytes()
+        self.assertEqual(encode_action(action, db, self.quantizer), [expected])
+
+    def test_q2bf16_ple_sidecar_is_bf16(self):
+        layout = ple_gguf_layout(4, "pack", "a" * 40, dim=32,
+                                 profile=Q2BF16_PROFILE)
+        self.assertEqual(layout.specs[0].dtype, "BF16")
+        self.assertEqual(layout.row_bytes, 64)
+        self.assertEqual(layout.specs[0].nbytes, 4 * 64)
+        self.assertEqual(Q2BF16_PROFILE.ple_qtype, "BF16")
+        self.assertEqual(Q2_PROFILE.ple_qtype, "Q4_1")
+
+    def test_q2bf16_cli_requires_imatrix_and_weight_energy(self):
+        base = [
+            "--profile", "q2bf16",
+            "--src", "/source",
+            "--out", "/output",
+            "--source-revision", "a" * 40,
+            "--tokenizer-template", "/tokenizer.gguf",
+        ]
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as error:
+                parse_args(base)
+        self.assertEqual(error.exception.code, 2)
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as error:
+                parse_args(base + ["--imatrix", "/imatrix.gguf"])
+        self.assertEqual(error.exception.code, 2)
+        parsed = parse_args(
+            base + ["--imatrix", "/imatrix.gguf",
+                    "--mtp-imatrix", "weight-energy"]
+        )
+        self.assertEqual(parsed.profile, "q2bf16")
 
     def test_optional_mtp_uses_the_same_qtype_rules(self):
         projection = "mtp.layers.0.self_attn.q_proj.weight"

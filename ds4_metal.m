@@ -1346,8 +1346,39 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+/* DS4_METAL_GPUSPAN=1 accounting, read by ds4.c's DS4_QWEN4_TIMING print. */
+static double ds4_gpu_now_ms(void);
+static double g_gpu_span_ms;
+static double g_gpu_span_wait_ms;
+static uint64_t g_gpu_span_cbs;
+
+void ds4_gpu_span_stats(double *gpu_ms, double *wait_ms, uint64_t *cbs) {
+    if (gpu_ms) *gpu_ms = g_gpu_span_ms;
+    if (wait_ms) *wait_ms = g_gpu_span_wait_ms;
+    if (cbs) *cbs = g_gpu_span_cbs;
+}
+
+/* Submit everything encoded so far and open a fresh batch, without waiting:
+ * the caller does host work that must overlap this submission (ds4.c's
+ * deferred PLE n-gram gather) and then calls ds4_gpu_end_commands(), which
+ * commits the fresh (empty) batch and waits for both. */
+int ds4_gpu_commit_batch(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 1;
+    return ds4_gpu_flush_commands();
+}
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    static int span_on = -1;
+    if (span_on < 0) span_on = getenv("DS4_METAL_GPUSPAN") != NULL;
+    const double span_t0 = span_on ? ds4_gpu_now_ms() : 0.0;
     [cb waitUntilCompleted];
+    if (span_on) {
+        const double busy = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+        if (busy > 0.0) g_gpu_span_ms += busy;
+        g_gpu_span_wait_ms += ds4_gpu_now_ms() - span_t0;
+        g_gpu_span_cbs++;
+    }
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -48161,6 +48192,9 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NAXC64,
     QWEN4_K_ROWS_F32_TO_F16,
     QWEN4_K_DENSE_MM,
+    QWEN4_K_DENSE_MM_BF16,
+    QWEN4_K_DENSE_MM_BF16_K64,
+    QWEN4_K_DENSE_MM_BF16_K64T64,
     QWEN4_K_DENSE_MM_REDUCE,
     QWEN4_K_BATCH_MM_Q8_T1,
     QWEN4_K_BATCH_MM_Q8_T2,
@@ -48185,6 +48219,12 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    /* BF16-spine hyper-connection variants (appended to keep existing ids) */
+    QWEN4_K_HC_NORM_BF16,
+    QWEN4_K_HC_NORM_REUSE_BF16,
+    QWEN4_K_HC_GATE_MIX_BF16,
+    QWEN4_K_HC_GATE_MIX_PAIR_BF16,
+    QWEN4_K_HC_COMBINE_NORM_BF16,
     QWEN4_K_COUNT,
 };
 
@@ -48266,6 +48306,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_naxc64",
     "kernel_qwen4_rows_f32_to_f16",
     "kernel_qwen4_dense_mm",
+    "kernel_qwen4_dense_mm_bf16",
+    "kernel_qwen4_dense_mm_bf16_k64",
+    "kernel_qwen4_dense_mm_bf16_k64t64",
     "kernel_qwen4_dense_mm_reduce",
     "kernel_qwen4_batch_mm_q8_t1",
     "kernel_qwen4_batch_mm_q8_t2",
@@ -48290,6 +48333,11 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen4_hc_norm_bf16",
+    "kernel_qwen4_hc_norm_reuse_bf16",
+    "kernel_qwen4_hc_gate_mix_bf16",
+    "kernel_qwen4_hc_gate_mix_pair_bf16",
+    "kernel_qwen4_hc_combine_norm_bf16",
 };
 
 typedef struct {
@@ -48457,13 +48505,19 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
     return qwen4_dispatch_resident(kernel, args, args_len, binds, n_binds, grid, tg, tg_mem, NULL, 0u);
 }
 
-/* bytes of one hc mixer row of n elements: f16, f32 or q8_0 */
+/* bytes of one hc mixer row of n elements: f16, f32, bf16 or q8_0 */
 static uint64_t qwen4_hc_row_bytes(uint32_t weight_type, uint64_t n) {
-    return weight_type == 1u ? n * 2u : weight_type == 0u ? n * 4u : weight_type == 8u ? (n / 32u) * 34u : 0u;
+    return weight_type == 1u ? n * 2u : weight_type == 0u ? n * 4u : weight_type == 30u ? n * 2u :
+           weight_type == 8u ? (n / 32u) * 34u : 0u;
 }
 
-static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8) {
-    return weight_type == 1u ? k16 : weight_type == 0u ? k32 : kq8;
+/* bytes of a 1-D f32/f16/bf16 vector of n elements (0 for unsupported) */
+static uint64_t qwen4_vec_bytes(uint32_t type, uint64_t n) {
+    return type == 0u ? n * 4u : (type == 1u || type == 30u) ? n * 2u : 0u;
+}
+
+static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8, int kbf16) {
+    return weight_type == 1u ? k16 : weight_type == 0u ? k32 : weight_type == 30u ? kbf16 : kq8;
 }
 
 static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
@@ -48487,22 +48541,51 @@ int ds4_gpu_qwen4_decode_fusions_enabled(void) {
     return override >= 0 ? override : ds4_gpu_device_name_contains("M3 Ultra");
 }
 
+/* The grouped-norm family is a handful of threadgroups over a few hundred
+ * kilobytes. At the decode width (n_hc * 8 = 32 threadgroups) each row stream
+ * is cut into 320-element chunks, so 128 threads leave two elements per thread
+ * and the three barrier rounds set the pace: the pass is latency-bound, not
+ * byte-bound. Measured at the T=1 shape, 128 threads 15.0 us, 256 11.3, 512
+ * 9.3, 1024 12.1. Once the grid already fills the machine (any T > 2) the
+ * extra lanes idle in the chunk loop and cost instead of paying: the T=256
+ * shape goes 82.7 -> 160.4 us. The kernel takes its width from ntg.x, so this
+ * is a dispatch-structure choice, not a kernel one.
+ *
+ * The faster width is NOT the default: the RMS reduction runs over the whole
+ * row per threadgroup and its simdgroup count is the thread count, so a wider
+ * threadgroup re-associates that sum. At 512 threads the greedy token stream
+ * diverges from the 128-thread stream past ~100 tokens (measured: identical
+ * for 96, different at 200; verify acceptance 71.6% -> 76.1%, cycles 116 ->
+ * 113), which is the re-rounding signature the campaign had to discard once
+ * already. The decode path keeps the historical 128 threads; the switch
+ * exists so the trade can be re-measured deliberately. */
+#define QWEN4_HC_DECODE_THREADS 128u
+static NSUInteger qwen4_hc_threads(uint32_t n_tokens) {
+    /* Only the one- and two-row decode shapes: a wider prefill width
+     * re-rounds the prefill state, which moves the whole continuation and
+     * would hide the decode effect behind a different prompt. */
+    if (n_tokens > 2u) return 128u;
+    return (NSUInteger)ds4_gpu_env_u64("DS4_QWEN4_HC_THREADS", QWEN4_HC_DECODE_THREADS, 32u, 1024u);
+}
+
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
         ds4_gpu_tensor *next_R, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj,
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
-        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
+        uint32_t weight_type, uint32_t gamma_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, dim);
+    const uint64_t gbytes = qwen4_vec_bytes(gamma_type, dim);
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
-        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
+        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, gamma_type };
     qwen4_bind b[8];
-    if (n_tokens != 1u || weight_type != 1u || n_inject != n_hc) return 0;
+    if (n_tokens != 1u || (weight_type != 1u && weight_type != 30u) || n_inject != n_hc) return 0;
     if (ds4_gpu_tensor_buffer(next_R) == ds4_gpu_tensor_buffer(R) ||
         ds4_gpu_tensor_buffer(inj_part) == ds4_gpu_tensor_buffer(old_inj)) return 0;
-    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || gbytes == 0 ||
+        (dim % 32) != 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, gbytes, "hc norm gamma") ||
         !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output")) {
         return 0;
     }
@@ -48520,22 +48603,25 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
     if (!qwen4_bind_tensor(&b[5], next_R, dim * sizeof(float), "combine norm next R") ||
         !qwen4_bind_tensor(&b[6], blk, n_embd * sizeof(float), "combine norm block") ||
         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
-    return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
-        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
+    return qwen4_dispatch(weight_type == 30u ? QWEN4_K_HC_COMBINE_NORM_BF16 : QWEN4_K_HC_COMBINE_NORM,
+        &args, sizeof(args), b, 8,
+        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(qwen4_hc_threads(n_tokens), 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
-        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
+        uint32_t weight_type, uint32_t gamma_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, dim);
+    const uint64_t gbytes = qwen4_vec_bytes(gamma_type, dim);
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
-        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
+        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, gamma_type };
     qwen4_bind b[5];
-    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
+    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || gbytes == 0 ||
+        (dim % 32) != 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, gbytes, "hc norm gamma") ||
         !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output")) {
         return 0;
     }
@@ -48563,10 +48649,12 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         }
     }
     const int kernel = reuse
-        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
-        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
+        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32,
+                          QWEN4_K_HC_NORM_REUSE_Q8, QWEN4_K_HC_NORM_REUSE_BF16)
+        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32,
+                          QWEN4_K_HC_NORM_Q8, QWEN4_K_HC_NORM_BF16);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(qwen4_hc_threads(n_tokens), 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
@@ -48592,16 +48680,21 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
-                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
+                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8,
+                                              QWEN4_K_HC_GATE_MIX_PAIR_BF16))
                             : prefetch ? QWEN4_K_HC_GATE_MIX_F16_PF
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
-                                       QWEN4_K_HC_GATE_MIX_Q8);
+                                       QWEN4_K_HC_GATE_MIX_Q8, QWEN4_K_HC_GATE_MIX_BF16);
     /* More independent output rows share the activated inputs in MTP.
      * Keep the per-row lane mapping and reduction order unchanged. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
         ds4_gpu_device_name_contains("M3 Ultra") ? 16u : 4u;
+    /* Both paths' threadgroups per output column are live A/B switches: the
+     * bf16 rows are read-bound on bytes in flight per lane, which depends on
+     * the shape of the grid they are spread over. */
     const uint32_t nsg = pair ?
-        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u) : 4u;
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_PAIR_NSG", default_nsg, 1u, 16u)
+        : (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_HC_NSG", 4u, 1u, 16u);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
                           MTLSizeMake((n_embd + nsg - 1u) / nsg, pair ? 1u : n_tokens, 1), MTLSizeMake(nsg * 32u, 1, 1),
                           pair ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
@@ -48921,15 +49014,17 @@ int ds4_gpu_qwen4_conv_stream_rows2_tensor(
 
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
-        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps) {
-    struct { uint32_t n_tokens, n_head, head_dim; float eps; } args = { n_tokens, n_head, head_dim, eps };
+    struct { uint32_t n_tokens, n_head, head_dim, weight_type; float eps; } args =
+        { n_tokens, n_head, head_dim, weight_type, eps };
     qwen4_bind b[3];
     const uint64_t bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    if (n_tokens == 0 || head_dim < 32 || (head_dim % 32) != 0 ||
+    const uint64_t wbytes = qwen4_vec_bytes(weight_type, head_dim);
+    if (n_tokens == 0 || head_dim < 32 || (head_dim % 32) != 0 || wbytes == 0 ||
         !qwen4_bind_tensor(&b[0], o, bytes, "gdn out") ||
         !qwen4_bind_tensor(&b[1], z, bytes, "gdn gate") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset, (uint64_t)head_dim * sizeof(float),
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset, wbytes,
                            "ssm_norm")) {
         return 0;
     }
@@ -48942,17 +49037,18 @@ int ds4_gpu_qwen4_ple_gate_tensor(
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
         const void *model_map, uint64_t model_size,
         uint64_t g_key_offset, uint64_t g_query_offset, uint64_t g_conv_offset,
-        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps) {
+        uint32_t norm_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, float eps) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
-    struct { uint32_t n_tokens, n_embd, n_hc; float eps; } args = { n_tokens, n_embd, n_hc, eps };
+    const uint64_t gbytes = qwen4_vec_bytes(norm_type, dim);
+    struct { uint32_t n_tokens, n_embd, n_hc, norm_type; float eps; } args = { n_tokens, n_embd, n_hc, norm_type, eps };
     qwen4_bind b[8];
-    if (n_tokens == 0 ||
+    if (n_tokens == 0 || gbytes == 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "ple residual") ||
         !qwen4_bind_tensor(&b[1], key, n_tokens * dim * sizeof(float), "ple key") ||
         !qwen4_bind_tensor(&b[2], value, (uint64_t)n_tokens * n_embd * sizeof(float), "ple value") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, g_key_offset, dim * sizeof(float), "ple norm_key") ||
-        !qwen4_bind_weight(&b[4], model_map, model_size, g_query_offset, dim * sizeof(float), "ple norm_query") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, g_conv_offset, dim * sizeof(float), "ple norm_conv") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_key_offset, gbytes, "ple norm_key") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, g_query_offset, gbytes, "ple norm_query") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_conv_offset, gbytes, "ple norm_conv") ||
         !qwen4_bind_tensor(&b[6], gated, n_tokens * dim * sizeof(float), "ple gated") ||
         !qwen4_bind_tensor(&b[7], normed, n_tokens * dim * sizeof(float), "ple normed")) {
         return 0;
@@ -48967,9 +49063,9 @@ int ds4_gpu_qwen4_ple_conv_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_channels, uint32_t conv_kernel, uint32_t dilation,
         ds4_gpu_tensor *snap_history, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_history, uint32_t snap2_tok) {
-    const uint32_t wsize = weight_type == 1u ? 2u : weight_type == 0u ? 4u : 0u;
-    struct { uint32_t n_tokens, n_channels, conv_kernel, dilation, weight_f16, snap_tok, snap2_tok, pad2; } args =
-        { n_tokens, n_channels, conv_kernel, dilation, weight_type == 1u ? 1u : 0u,
+    const uint32_t wsize = weight_type == 1u ? 2u : weight_type == 0u ? 4u : weight_type == 30u ? 2u : 0u;
+    struct { uint32_t n_tokens, n_channels, conv_kernel, dilation, weight_type, snap_tok, snap2_tok, pad2; } args =
+        { n_tokens, n_channels, conv_kernel, dilation, weight_type,
           snap_history ? snap_tok : UINT32_MAX, snap2_history ? snap2_tok : UINT32_MAX, 0 };
     if (wsize == 0) return 0;
     const uint64_t rows = (uint64_t)n_tokens * n_channels * sizeof(float);
@@ -49061,21 +49157,24 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t norm_type,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap,
         float rope_base, float eps) {
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t norm_type; float rope_mscale; float rope_freq[32];
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_tokens * n_idx_head * idx_dim * sizeof(float);
     const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    const uint64_t gq_bytes = qwen4_vec_bytes(norm_type, head_dim);
+    const uint64_t giq_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[15];
-    if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+    if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 || gq_bytes == 0 || giq_bytes == 0 ||
         idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
         n_rot > idx_dim || (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
         !qwen4_bind_tensor(&b[0], qg, 2u * q_bytes, "attn q/gate projection") ||
@@ -49083,11 +49182,11 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
         !qwen4_bind_tensor(&b[3], iq, iq_bytes, "indexer q projection") ||
         !qwen4_bind_tensor(&b[4], ik, (uint64_t)n_tokens * idx_dim * sizeof(float), "indexer k projection") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float),
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, gq_bytes,
                            "attn q_norm") ||
-        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float),
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, gq_bytes,
                            "attn k_norm") ||
-        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, (uint64_t)idx_dim * sizeof(float),
+        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, giq_bytes,
                            "indexer q_norm") ||
         !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn q") ||
         !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn gate") ||
@@ -49104,18 +49203,20 @@ int ds4_gpu_qwen4_attn_prep_tensor(
 
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
-        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset, uint32_t norm_type,
         uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot,
         float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t norm_type;
              float rope_mscale; float rope_freq[32]; } args =
-        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
+    const uint64_t gik_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[4];
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
+        gik_bytes == 0 ||
         !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
+        !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, gik_bytes,
                            "indexer k_norm") ||
         !qwen4_bind_tensor(&b[2], pos3, n_keys * 16u, "rope positions") ||
         !qwen4_bind_tensor(&b[3], block_key, ((uint64_t)block0 + n_blocks) * idx_dim * 2u, "block keys")) {
@@ -49363,21 +49464,25 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t norm_type,
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t n_idx_head, uint32_t idx_dim, float rope_base, float eps) {
     /* The caller checks each row's position against its own cache; the
      * kernel does not read cache_cap. */
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t norm_type; float rope_mscale; float rope_freq[32];
     } args = { n_rows, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, 0u, 0u,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_rows * n_idx_head * idx_dim * sizeof(float);
+    const uint64_t gq_bytes = qwen4_vec_bytes(norm_type, head_dim);
+    const uint64_t giq_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[12], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+        gq_bytes == 0 || giq_bytes == 0 ||
         idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
         n_rot > idx_dim || n_head_kv == 0 || (n_head % n_head_kv) != 0) {
         return 0;
@@ -49387,9 +49492,9 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn rows v projection") ||
         !qwen4_bind_tensor(&b[3], iq, iq_bytes, "indexer rows q projection") ||
         !qwen4_bind_tensor(&b[4], ik, (uint64_t)n_rows * idx_dim * sizeof(float), "indexer rows k projection") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float), "attn q_norm") ||
-        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float), "attn k_norm") ||
-        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, (uint64_t)idx_dim * sizeof(float), "indexer q_norm") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, gq_bytes, "attn q_norm") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, gq_bytes, "attn k_norm") ||
+        !qwen4_bind_weight(&b[7], model_map, model_size, g_iq_offset, giq_bytes, "indexer q_norm") ||
         !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn rows q") ||
         !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn rows gate") ||
         !qwen4_bind_tensor(&b[10], iq_out, iq_bytes, "indexer rows q") ||
@@ -49403,16 +49508,17 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
 
 int ds4_gpu_qwen4_idx_block_key_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
-        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset, uint32_t norm_type,
         uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t norm_type;
              float rope_mscale; float rope_freq[32]; } args =
-        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, norm_type, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
+    const uint64_t gik_bytes = qwen4_vec_bytes(norm_type, idx_dim);
     qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||
-        (idx_dim % 32) != 0 || n_rot > idx_dim ||
-        !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float), "indexer k_norm") ||
+        (idx_dim % 32) != 0 || n_rot > idx_dim || gik_bytes == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, g_ik_offset, gik_bytes, "indexer k_norm") ||
         !qwen4_bind_rows(&b[1], table, entry0, n_rows)) {
         return 0;
     }
@@ -50089,14 +50195,16 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 int ds4_gpu_qwen4_mtp_stage_tensor(
         ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
-        uint32_t n_embd, uint32_t n_hc, float eps) {
-    struct { uint32_t n_embd, n_hc, pad0; float eps; } args = { n_embd, n_hc, 0u, eps };
+        uint32_t norm_type, uint32_t n_embd, uint32_t n_hc, float eps) {
+    struct { uint32_t n_embd, n_hc, norm_type; float eps; } args = { n_embd, n_hc, norm_type, eps };
+    const uint64_t ge_bytes = qwen4_vec_bytes(norm_type, n_embd);
+    const uint64_t gh_bytes = qwen4_vec_bytes(norm_type, (uint64_t)n_embd * n_hc);
     qwen4_bind b[5];
-    if (n_embd == 0 || n_hc == 0 ||
+    if (n_embd == 0 || n_hc == 0 || ge_bytes == 0 || gh_bytes == 0 ||
         !qwen4_bind_tensor(&b[0], e, (uint64_t)n_embd * sizeof(float), "mtp embedding") ||
         !qwen4_bind_tensor(&b[1], R, (uint64_t)n_embd * n_hc * sizeof(float), "mtp streams") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, (uint64_t)n_embd * sizeof(float), "mtp enorm") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, (uint64_t)n_embd * n_hc * sizeof(float),
+        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, ge_bytes, "mtp enorm") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, gh_bytes,
                            "mtp hnorm") ||
         !qwen4_bind_tensor(&b[4], cat, (uint64_t)(n_hc + 1u) * 2u * n_embd * sizeof(float), "mtp concat")) {
         return 0;
@@ -50175,7 +50283,7 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows) {
-    struct { uint32_t n_tokens, in_dim, n_out, pad0, rows[4], types[4], row_bytes[4]; } args = {0};
+    struct { uint32_t n_tokens, in_dim, n_out, multi_row, rows[4], types[4], row_bytes[4], ksplit, stage, stage_floats, pad3; } args = {0};
     qwen4_bind b[9];
     if (!x || n_tokens == 0 || in_dim == 0 || (in_dim % 32) != 0 || n_out == 0 || n_out > 4 ||
         !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * in_dim * sizeof(float), "multi gemv input")) {
@@ -50185,6 +50293,8 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
     args.in_dim = in_dim;
     args.n_out = n_out;
     uint32_t total = 0;
+    uint64_t weight_bytes = 0;
+    bool all_wide = true;
     for (uint32_t i = 0; i < 4; i++) {
         if (i < n_out) {
             const uint32_t rb = qwen4_expert_row_bytes(types[i], in_dim);
@@ -50199,13 +50309,123 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
             args.types[i] = types[i];
             args.row_bytes[i] = rb;
             total += out_rows[i];
+            weight_bytes += (uint64_t)rb * out_rows[i];
+            all_wide = all_wide && (types[i] == 30u || types[i] == 1u || types[i] == 8u);
         } else {
             b[1 + i] = b[1];
             b[5 + i] = b[5];
         }
     }
+    /* A projection with few output rows launches too few threadgroups to fill
+     * the machine, so its row walk runs at a fraction of the read bandwidth.
+     * Splitting k across the threadgroup's SIMD groups multiplies the
+     * parallelism; every row is still finished by exactly one threadgroup and
+     * one fixed slice order, so the decode row and the two/three-row verify
+     * rows of that row keep rounding identically.  The slice sum rounds
+     * differently from the historical whole-row walk, so logits move by a few
+     * ULP; DS4_QWEN4_GEMV_KSPLIT=1 restores the old walk for A/B.
+     *
+     * The rate tracks the warp count at this shape, so the narrow policy takes
+     * both levers: eight SIMD groups (256 threads) and up to eight k slices.
+     * Measured cold at 10240 -> 320 bf16, holding everything else equal:
+     * ksplit 1 (160 warps) 235 GB/s, 2 (320) 333, 4 (640) 393, 8 (1280) 414. */
+    const NSUInteger threads = 256u;
+    const NSUInteger nsg = threads / 32u;
+    const uint32_t ksplit_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_KSPLIT", 0u, 0u, (uint64_t)nsg);
+    uint32_t ksplit = ksplit_env ? ksplit_env : (total < 1024u ? 8u : 1u);
+    if (ksplit > nsg) ksplit = (uint32_t)nsg;
+    args.ksplit = ksplit;
+    /* Verify rows (T = 2..4) read each weight row once for all T tokens: the
+     * bf16, f16 and q8_0 walks each keep T accumulators per lane and the
+     * dispatch drops grid.y, so the second and third rows cost their activation
+     * reads instead of a full re-read of the matrix (measured at 2560 ->
+     * 248320, the output head: us(T=2)/us(T=1) 2.00 -> 1.0x).  Row values are
+     * the single-row walk's to the bit, and only those three walks share the
+     * read, so the multi-row dispatch is taken only when every bound
+     * projection is one of them and the projection is wide enough for the
+     * k-split rule to have left it with the whole-row walk (ksplit 1): a narrow
+     * projection's threadgroups are already one row pair each, so it has no
+     * weight re-read to save and loses parallelism when the dispatch drops
+     * grid.y.
+     * DS4_QWEN4_GEMV_MULTIROW=0 keeps the per-token grid for A/B. */
+    const uint32_t multi_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_MULTIROW", 2u, 0u, 2u);
+    const bool multi_row = (multi_env == 2u ? all_wide : multi_env == 1u) &&
+                           n_tokens >= 2u && n_tokens <= 4u && ksplit <= 1u;
+    args.multi_row = multi_row ? 1u : 0u;
+    /* The activation rows are the other half of the verify row's cost: every
+     * weight-row walk also reads the T activation rows (4 B per element per
+     * token against the bf16 weight's 2 B), and a threadgroup owns
+     * rows_per_tg rows of the same activations.  Staging them once per
+     * threadgroup is what the pair kernel does at 320 -> 10240, and it is the
+     * difference between the second row costing an activation read per row and
+     * one per threadgroup.  Threadgroup memory is 32 KiB and shared with the
+     * k-split partials, so this is only for the widths that fit: at 2560 the
+     * full T = 2 and T = 3 rows fit with room to spare, 6144 fits as a prefix
+     * whose remaining pair-steps are read from device memory (the step order
+     * is the same either way).  A threadgroup only pays for staging when the
+     * dispatch is long enough to be read-bound rather than launch-bound: below
+     * a few MiB of weights the activation rows stay in L1 across a
+     * threadgroup's rows anyway (the narrow shapes launch under one
+     * threadgroup per core, so nothing evicts them), and there the staged copy
+     * is a latency bubble the dispatch cannot hide.
+     * DS4_QWEN4_GEMV_STAGE=<bytes> caps the staging footprint (0 disables it
+     * for A/B); the default is the whole 32 KiB the device allows. */
+    const uint32_t stage_env = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GEMV_STAGE", 32768u, 0u, 32768u);
+    const NSUInteger red_bytes = nsg * 2u * (multi_row ? 4u : 1u) * sizeof(float);
+    uint32_t stage_floats = 0;
+    if (multi_row && stage_env > red_bytes && (in_dim % 8u) == 0u && weight_bytes >= (8u << 20)) {
+        bool offsets_ok = true;
+        for (uint32_t i = 0; i < n_out; i++) offsets_ok = offsets_ok && (offsets[i] & 15u) == 0u;
+        uint64_t per_tok = (stage_env - red_bytes) / ((uint64_t)n_tokens * sizeof(float));
+        if (per_tok > in_dim) per_tok = in_dim;
+        per_tok &= ~3ull;                     /* whole float4 vectors, as the copy moves */
+        if ((per_tok >> 10) >= 1u && offsets_ok) stage_floats = (uint32_t)per_tok;
+    }
+    args.stage = stage_floats ? 1u : 0u;
+    args.stage_floats = stage_floats;
+    const NSUInteger rows_per_tg = (nsg * 2u) / ksplit;
     return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
-                          MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(((NSUInteger)total + rows_per_tg - 1u) / rows_per_tg,
+                                      multi_row ? 1u : n_tokens, 1),
+                          MTLSizeMake(threads, 1, 1),
+                          red_bytes + (NSUInteger)stage_floats * n_tokens * sizeof(float));
+}
+
+/* Benchmark-only DRAM read ceiling; see kernel_qwen4_stream_read_bench in
+ * metal/qwen4.metal and the declaration in ds4_gpu.h.  `threadgroups` is what
+ * the caller varies to show how much memory-level parallelism a kernel of that
+ * grid shape can reach; it does not change the bytes read. */
+int ds4_gpu_qwen4_stream_read_bench_tensor(
+        ds4_gpu_tensor *sink, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes, uint32_t threadgroups) {
+    if (!sink || bytes < 16u) return 0;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_qwen4_stream_read_bench");
+    if (!pipeline) return 0;
+
+    qwen4_bind b[2];
+    if (!qwen4_bind_weight(&b[0], model_map, model_size, offset, bytes, "bench stream range") ||
+        !qwen4_bind_tensor(&b[1], sink, sizeof(uint32_t), "bench stream sink")) {
+        return 0;
+    }
+    const uint64_t n_vec = bytes / 16u;
+    /* One uint4 per thread unless the caller asks for a narrower grid; the
+     * kernel's grid-stride loop then walks the same range at that occupancy. */
+    const uint64_t threads = threadgroups ? (uint64_t)threadgroups * 256u
+                                          : ((n_vec + 255u) / 256u) * 256u;
+    if (threads == 0 || threads > 0xffffffffull) return 0;
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:b[0].buf offset:b[0].off atIndex:0];
+    [enc setBuffer:b[1].buf offset:b[1].off atIndex:1];
+    [enc setBytes:&n_vec length:sizeof(n_vec) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(threads / 256u), 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "bench stream read");
 }
 
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
@@ -50241,12 +50461,13 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
+    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : (weight_type == 1u || weight_type == 30u) ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
     struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
         { n_tokens, in_dim, out_rows, weight_type, row_bytes, 1, 0, 0 };
     qwen4_bind b[3];
-    if (n_tokens == 0 || row_bytes == 0 || (weight_type != 0u && weight_type != 1u && weight_type != 8u) ||
+    if (n_tokens == 0 || row_bytes == 0 ||
+        (weight_type != 0u && weight_type != 1u && weight_type != 8u && weight_type != 30u) ||
         (weight_type == 8u && (in_dim % 32) != 0) || (in_dim % 8) != 0 || out_rows == 0) {
         fprintf(stderr, "ds4: Qwen3.8 dense mm rejected type %u in %u out %u tokens %u\n",
                 weight_type, in_dim, out_rows, n_tokens);
@@ -50265,7 +50486,28 @@ int ds4_gpu_qwen4_dense_mm_tensor(
      * The split is chosen so the partials stay small and every threadgroup
      * still walks enough k to amortize its staging. */
     const uint32_t tiles = (out_rows + 31u) / 32u;
-    const uint32_t threadgroups = tiles * ((n_tokens + 31u) / 32u);
+    /* A bf16 weight matrix (the BF16-spine pack's dense projections) runs the
+     * bf16-operand MMA: staged bf16 tiles and simdgroup_bfloat8x8 with fp32
+     * accumulators, which this GPU issues at about 1.6x the fp32 simdgroup
+     * rate and which halves the staged bytes.  The other weight types keep
+     * the fp32 staging kernel and their existing rounding.
+     * DS4_QWEN4_DENSE_MM_BF16 picks the tile: 0 leaves bf16 on the fp32
+     * kernel, 1 is the 32x32x32 reference tile, 2 deepens k to 64, 3 deepens
+     * both k and the token tile to 64. */
+    int dense_kernel = QWEN4_K_DENSE_MM;
+    uint32_t tok_tile = 32u;
+    if (weight_type == 30u) {
+        const uint64_t bf16_tile = ds4_gpu_env_u64("DS4_QWEN4_DENSE_MM_BF16", 1u, 0u, 3u);
+        if (bf16_tile == 1u) {
+            dense_kernel = QWEN4_K_DENSE_MM_BF16;
+        } else if (bf16_tile == 2u) {
+            dense_kernel = QWEN4_K_DENSE_MM_BF16_K64;
+        } else if (bf16_tile == 3u) {
+            dense_kernel = QWEN4_K_DENSE_MM_BF16_K64T64;
+            tok_tile = 64u;
+        }
+    }
+    const uint32_t threadgroups = tiles * ((n_tokens + tok_tile - 1u) / tok_tile);
     uint32_t n_split = 1u;
     if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
         const uint32_t nk = (in_dim + 31u) / 32u;
@@ -50276,8 +50518,9 @@ int ds4_gpu_qwen4_dense_mm_tensor(
     }
     args.n_split = n_split;
     if (n_split <= 1u) {
-        return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
-                              MTLSizeMake(tiles, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);
+        return qwen4_dispatch(dense_kernel, &args, sizeof(args), b, 3,
+                              MTLSizeMake(tiles, (n_tokens + tok_tile - 1u) / tok_tile, 1),
+                              MTLSizeMake(128, 1, 1), 0);
     }
 
     const uint64_t plane = (uint64_t)n_tokens * out_rows * sizeof(float);
@@ -50288,8 +50531,9 @@ int ds4_gpu_qwen4_dense_mm_tensor(
     if (!qwen4_bind_tensor(&bp[2], g_qwen4_dense_mm_partials, plane * n_split, "dense mm partials")) {
         return 0;
     }
-    if (!qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), bp, 3,
-                        MTLSizeMake(tiles, (n_tokens + 31) / 32, n_split), MTLSizeMake(128, 1, 1), 0)) {
+    if (!qwen4_dispatch(dense_kernel, &args, sizeof(args), bp, 3,
+                        MTLSizeMake(tiles, (n_tokens + tok_tile - 1u) / tok_tile, n_split),
+                        MTLSizeMake(128, 1, 1), 0)) {
         return 0;
     }
     qwen4_bind br[2];

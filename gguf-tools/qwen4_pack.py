@@ -9,8 +9,11 @@
 """Build the versioned DS4 Qwen3.8-Flash-Next fast pack.
 
 The converter consumes the official BF16 safetensors checkpoint.  It emits
-one deterministic trunk GGUF, an SSD-backed Q4_1 PLE GGUF, and optional
-vision/MTP GGUF sidecars.  Unsloth/GGUF input is deliberately not a supported
+one deterministic trunk GGUF, an SSD-backed PLE GGUF, and optional
+vision/MTP GGUF sidecars.  The Q2 BF16-spine profile keeps the IQ2_XXS/Q2_K
+routed experts from the calibrated Q2 recipe but stores every other tensor
+(and the n-gram table) as BF16 straight from the official checkpoint.
+Unsloth/GGUF input is deliberately not a supported
 source format: DS4 records and validates the official source revision and the
 exact GGML block geometry used by its native kernels.
 """
@@ -78,6 +81,19 @@ Q2_BASE_NAME = (
 Q2_PLE_NAME = "Qwen3.8-Flash-Next-Q2-PLE-Q4_1.gguf"
 Q2_VISION_NAME = "qwen3.8-flash-next-q2-vision.gguf"
 Q2_MTP_NAME = "qwen3.8-flash-next-q2-mtp.gguf"
+# Q2-BF16spine: same expert recipe as Q2, but every non-expert, non-ngram
+# tensor is written as BF16 straight from the official BF16 checkpoint.
+Q2BF16_PACK_VERSION = 1
+Q2BF16_CONVERSION_STATE_VERSION = 1
+Q2BF16_MANIFEST_NAME = "qwen3.8-flash-next-q2bf16.manifest.json"
+Q2BF16_STATE_NAME = "qwen3.8-flash-next-q2bf16.conversion-state.json"
+Q2BF16_BASE_NAME = (
+    "Qwen3.8-Flash-Next-IQ2XXSGateUp-Q2KDown-BF16Spine-"
+    "BF16GDN-BF16QSA-BF16Shared-BF16Out.gguf"
+)
+Q2BF16_PLE_NAME = "Qwen3.8-Flash-Next-Q2BF16-PLE-BF16.gguf"
+Q2BF16_VISION_NAME = "qwen3.8-flash-next-q2bf16-vision.gguf"
+Q2BF16_MTP_NAME = "qwen3.8-flash-next-q2bf16-mtp.gguf"
 Q2_IMATRIX_REPOSITORY = "unsloth/Qwen3.8-Flash-Next-GGUF"
 Q2_IMATRIX_REVISION = "c8b5954a88c2775c546b92593eda40ea041d3176"
 Q2_IMATRIX_SHA256 = (
@@ -168,6 +184,18 @@ class PackProfile:
     down_qtype: str
     required_ds4_version: str
     pack_identity: str
+    spine_bf16: bool = False
+    ple_qtype: str = "Q4_1"
+
+    @property
+    def q2_experts(self) -> bool:
+        """True when the routed experts need the calibrated Q2 imatrix."""
+        return self.gate_up_qtype == "IQ2_XXS"
+
+    @property
+    def spine_qtype(self) -> str:
+        """Storage type for the non-expert dense/spine projections."""
+        return "BF16" if self.spine_bf16 else "Q8_0"
 
 
 Q4_PROFILE = PackProfile(
@@ -200,7 +228,26 @@ Q2_PROFILE = PackProfile(
     required_ds4_version="qwen3.8-flash-next-q2",
     pack_identity="ds4-qwen3.8-flash-next-q2-v4",
 )
-PACK_PROFILES = {profile.name: profile for profile in (Q4_PROFILE, Q2_PROFILE)}
+Q2BF16_PROFILE = PackProfile(
+    name="q2bf16",
+    pack_version=Q2BF16_PACK_VERSION,
+    state_version=Q2BF16_CONVERSION_STATE_VERSION,
+    manifest_name=Q2BF16_MANIFEST_NAME,
+    state_name=Q2BF16_STATE_NAME,
+    base_name=Q2BF16_BASE_NAME,
+    ple_name=Q2BF16_PLE_NAME,
+    vision_name=Q2BF16_VISION_NAME,
+    mtp_name=Q2BF16_MTP_NAME,
+    gate_up_qtype="IQ2_XXS",
+    down_qtype="Q2_K",
+    required_ds4_version="qwen3.8-flash-next-q2bf16",
+    pack_identity="ds4-qwen3.8-flash-next-q2bf16-v1",
+    spine_bf16=True,
+    ple_qtype="BF16",
+)
+PACK_PROFILES = {
+    profile.name: profile for profile in (Q4_PROFILE, Q2_PROFILE, Q2BF16_PROFILE)
+}
 
 CONFIG = {
     "layers": 48,
@@ -1278,12 +1325,28 @@ def make_action(db: SourceDB, source: str,
             [TensorSpec(target, dtype, shape, "vision_embedding", source)],
         )
     # Q8_0 has 32-value blocks. The official visual FC2 consumes 4304 features,
-    # so append 16 zero-valued columns and advertise the physical width.
+    # so append 16 zero-valued columns and advertise the physical width.  The
+    # BF16 spine keeps the same physical geometry with a raw BF16 padding.
     if (target.startswith("model.visual.blocks.") and
             target.endswith(".mlp.linear_fc2.weight")):
         if dtype != "BF16" or shape != (1152, 4304):
             fail(f"{source}: invalid Qwen visual FC2 geometry")
         padded_shape = (1152, CONFIG["vision_fc2_physical_input"])
+        if profile.spine_bf16:
+            padding = {
+                "axis": -1,
+                "logical": shape[-1],
+                "physical": padded_shape[-1],
+                "fill": 0,
+            }
+            return Action(
+                source, "copy", "vision_projection",
+                [TensorSpec(
+                    target, "BF16", padded_shape, "vision_projection",
+                    source, logical_shape=shape, padding=padding,
+                )],
+                pad_last_to=CONFIG["vision_fc2_physical_input"],
+            )
         return Action(
             source,
             "quant",
@@ -1311,7 +1374,7 @@ def make_action(db: SourceDB, source: str,
                              profile.gate_up_qtype)
         imatrix_names = ()
         mtp_fallback = False
-        if profile.name == "q2":
+        if profile.q2_experts:
             layer = layer_of(renamed(source))
             if layer is None:
                 if ".mtp." in target and MTP_IMATRIX_MODE == "weight-energy":
@@ -1340,7 +1403,7 @@ def make_action(db: SourceDB, source: str,
         kind = "quant"
         imatrix_names = ()
         mtp_fallback = False
-        if profile.name == "q2":
+        if profile.q2_experts:
             layer = layer_of(renamed(source))
             if layer is None:
                 if ".mtp." in target and MTP_IMATRIX_MODE == "weight-energy":
@@ -1366,6 +1429,12 @@ def make_action(db: SourceDB, source: str,
 
     if dtype == "BF16" and len(shape) == 2 and not is_bf16_control(target):
         role = q8_role(target)
+        if profile.spine_bf16:
+            return Action(
+                source, "copy", role,
+                [TensorSpec(target, "BF16", shape, role, source)],
+                scale=scale,
+            )
         if shape[-1] % QTYPE_LAYOUT["Q8_0"][0]:
             fail(
                 f"{source}: Q8_0 projection width {shape[-1]} requires "
@@ -1485,10 +1554,24 @@ def encode_action(action: Action, db: SourceDB,
         value = f32_to_bf16(
             bf16_to_f32(value) * np.float32(action.scale)
         )
-    if action.kind == "copy":
+    if action.kind in ("copy", "conv"):
+        if action.kind == "conv":
+            value = np.swapaxes(value, 1, 2)
+        target_dtype = action.specs[0].dtype
+        if target_dtype == "BF16" and value.dtype != np.dtype("<u2"):
+            value = f32_to_bf16(value)
+        elif target_dtype != "BF16" and value.dtype == np.dtype("<u2"):
+            value = bf16_to_f32(value)
+        if action.pad_last_to:
+            if action.pad_last_to < value.shape[-1]:
+                fail(f"{action.source}: physical padding shrinks the source")
+            value = np.pad(
+                value,
+                [(0, 0)] * (value.ndim - 1) +
+                [(0, action.pad_last_to - value.shape[-1])],
+                mode="constant",
+            )
         return [np.ascontiguousarray(value).tobytes()]
-    if action.kind == "conv":
-        return [np.ascontiguousarray(np.swapaxes(value, 1, 2)).tobytes()]
     if action.kind == "norm_fold":
         return [f32_to_bf16(bf16_to_f32(value) + 1.0).tobytes()]
     if action.kind == "quant":
@@ -1595,14 +1678,14 @@ def common_metadata(pack_id: str, source_revision: str,
         ),
         kv_string("ds4.pack.quant.embedding", "BF16"),
         kv_string("ds4.pack.quant.control", "source"),
-        kv_string("ds4.pack.quant.dense", "Q8_0"),
-        kv_string("ds4.pack.quant.gdn", "Q8_0"),
-        kv_string("ds4.pack.quant.qsa", "Q8_0"),
-        kv_string("ds4.pack.quant.shared", "Q8_0"),
-        kv_string("ds4.pack.quant.output", "Q8_0"),
-        kv_string("ds4.pack.quant.ple_projection", "Q8_0"),
-        kv_string("ds4.pack.quant.vision_projection", "Q8_0"),
-        kv_string("ds4.pack.quant.ple", "Q4_1"),
+        kv_string("ds4.pack.quant.dense", profile.spine_qtype),
+        kv_string("ds4.pack.quant.gdn", profile.spine_qtype),
+        kv_string("ds4.pack.quant.qsa", profile.spine_qtype),
+        kv_string("ds4.pack.quant.shared", profile.spine_qtype),
+        kv_string("ds4.pack.quant.output", profile.spine_qtype),
+        kv_string("ds4.pack.quant.ple_projection", profile.spine_qtype),
+        kv_string("ds4.pack.quant.vision_projection", profile.spine_qtype),
+        kv_string("ds4.pack.quant.ple", profile.ple_qtype),
         kv_u32("ds4.pack.padding.routed_down.logical_input", c["expert_ff"]),
         kv_u32(
             "ds4.pack.padding.routed_down.physical_input",
@@ -1656,7 +1739,7 @@ def common_metadata(pack_id: str, source_revision: str,
         kv_u32("qwen4-exp.vision.start_token_id", c["vision_start_token"]),
         kv_u32("qwen4-exp.vision.end_token_id", c["vision_end_token"]),
     ]
-    if profile.name == "q2":
+    if profile.q2_experts:
         routed_index = next(
             index for index, record in enumerate(records)
             if record.startswith(pack_string("ds4.pack.quant.routed"))
@@ -1838,12 +1921,21 @@ class PleGGUFLayout:
     final_size: int
 
 
-def ple_tensor_specs(rows: int, dim: int = 160) -> list[TensorSpec]:
-    if rows <= 0 or dim <= 0 or dim % QTYPE_LAYOUT["Q4_1"][0]:
-        fail("PLE Q4_1 geometry must have positive rows and 32-wide blocks")
+def ple_tensor_specs(rows: int, dim: int = 160,
+                     qtype: str = "Q4_1") -> list[TensorSpec]:
+    if rows <= 0 or dim <= 0:
+        fail("PLE geometry must have positive rows and width")
+    if qtype in QTYPE_LAYOUT:
+        if dim % QTYPE_LAYOUT[qtype][0]:
+            fail(
+                f"PLE {qtype} geometry must have "
+                f"{QTYPE_LAYOUT[qtype][0]}-wide blocks"
+            )
+    elif qtype != "BF16":
+        fail(f"unsupported PLE tensor type {qtype}")
     return [
         TensorSpec(
-            PLE_WEIGHT_NAME, "Q4_1", (rows, dim), "ple",
+            PLE_WEIGHT_NAME, qtype, (rows, dim), "ple",
             "official PLE n-gram embedding shards",
             logical_shape=(rows, dim),
         ),
@@ -1866,7 +1958,7 @@ def ple_gguf_layout(rows: int, pack_id: str, source_revision: str,
                     dim: int = 160,
                     profile: str | PackProfile = "q4") -> PleGGUFLayout:
     profile = pack_profile(profile)
-    specs = ple_tensor_specs(rows, dim)
+    specs = ple_tensor_specs(rows, dim, profile.ple_qtype)
     if len(specs) != ARTIFACT_TENSOR_COUNTS["ple"]:
         fail(
             f"PLE GGUF has {len(specs)} tensors, expected "
@@ -1947,12 +2039,17 @@ class PleGGUFWriter:
         if (row < 0 or count <= 0 or value.shape[1] != self.dim or
                 row + count > self.rows):
             fail("PLE source shard has incompatible geometry")
-        raw = self.quantizer.encode(value, "Q4_1")
+        if self.profile.ple_qtype == "BF16":
+            if value.dtype != np.dtype("<u2"):
+                value = f32_to_bf16(value)
+            raw = np.ascontiguousarray(value).tobytes()
+        else:
+            raw = self.quantizer.encode(value, self.profile.ple_qtype)
         expected = count * self.row_bytes
         if len(raw) != expected:
             fail(
-                f"PLE Q4_1 encoder wrote {len(raw)} bytes, expected "
-                f"{expected}"
+                f"PLE {self.profile.ple_qtype} encoder wrote {len(raw)} "
+                f"bytes, expected {expected}"
             )
         self.fp.seek(
             self.data_offset + self.weight_spec.offset + row * self.row_bytes
@@ -2270,6 +2367,7 @@ def write_pack_manifest(args, pack_id: str, tensor_records: dict,
     tensor_manifest = json.dumps(
         tensor_records, sort_keys=True, separators=(",", ":")
     ).encode()
+    spine_qtype = profile.spine_qtype
     manifest = {
         "schema": "ds4.qwen4.fast-pack",
         "version": profile.pack_version,
@@ -2289,21 +2387,25 @@ def write_pack_manifest(args, pack_id: str, tensor_records: dict,
             },
             "embeddings": {"qtype": "BF16"},
             "control": {"qtype": "source", "allowed": ["BF16", "F32"]},
-            "dense_projections": {
-                "qtype": "Q8_0",
-                "block_size": QTYPE_LAYOUT["Q8_0"][0],
-            },
-            "gdn_projections": {"qtype": "Q8_0"},
-            "qsa_projections": {"qtype": "Q8_0"},
-            "shared_expert_projections": {"qtype": "Q8_0"},
-            "output": {"qtype": "Q8_0"},
-            "ple_projections": {"qtype": "Q8_0"},
-            "vision_projections": {"qtype": "Q8_0"},
-            "ple_embedding": {
-                "qtype": "Q4_1",
-                "block_size": QTYPE_LAYOUT["Q4_1"][0],
-                "cpu_mapped": True,
-            },
+            "dense_projections": (
+                {"qtype": "BF16"} if profile.spine_bf16 else
+                {"qtype": "Q8_0", "block_size": QTYPE_LAYOUT["Q8_0"][0]}
+            ),
+            "gdn_projections": {"qtype": spine_qtype},
+            "qsa_projections": {"qtype": spine_qtype},
+            "shared_expert_projections": {"qtype": spine_qtype},
+            "output": {"qtype": spine_qtype},
+            "ple_projections": {"qtype": spine_qtype},
+            "vision_projections": {"qtype": spine_qtype},
+            "ple_embedding": (
+                {"qtype": "BF16", "cpu_mapped": True}
+                if profile.ple_qtype == "BF16" else
+                {
+                    "qtype": profile.ple_qtype,
+                    "block_size": QTYPE_LAYOUT[profile.ple_qtype][0],
+                    "cpu_mapped": True,
+                }
+            ),
             "physical_padding": {
                 "routed_down_input": {
                     "logical": CONFIG["expert_ff"],
@@ -2331,7 +2433,7 @@ def write_pack_manifest(args, pack_id: str, tensor_records: dict,
         "tensor_manifest_sha256": hashlib.sha256(tensor_manifest).hexdigest(),
         "tensors": tensor_records,
     }
-    if profile.name == "q2":
+    if profile.q2_experts:
         if imatrix is None:
             fail("Q2 pack manifest requires validated imatrix provenance")
         manifest["quantization"]["routed_experts"] = {
@@ -2404,7 +2506,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
                          tokenizer: list[bytes], chat_template: bytes,
                          imatrix: QwenGGUFImatrix | None = None):
     profile = profile_from_args(args)
-    if profile.name == "q2" and imatrix is None:
+    if profile.q2_experts and imatrix is None:
         fail("Q2 pack conversion requires a validated GGUF imatrix")
     refuse_legacy_artifacts(args.out, profile)
     selected = ["base"]
@@ -2462,7 +2564,7 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
         "remote_repo": args.remote_repo,
         "selected_artifacts": selected,
     }
-    if profile.name == "q2":
+    if profile.q2_experts:
         identity["profile"] = profile.name
         identity["pack_version"] = profile.pack_version
         identity["imatrix"] = imatrix.provenance()
@@ -2588,7 +2690,8 @@ def create_streamed_pack(args, db: SourceDB, plan: dict[str, list[Action]],
         staging_root = args.staging_dir or (
             args.out /
             (".qwen4-source-stage" if profile.name == "q4" else
-             ".qwen2-source-stage")
+             ".qwen2-source-stage" if profile.name == "q2" else
+             ".qwen2bf16-source-stage")
         )
         artifact_sizes = {
             args.out / filenames[key]: gguf_layout(
@@ -2969,10 +3072,14 @@ def rebuild_mtp_artifact(args, db: SourceDB,
 def plan_summary(plan: dict[str, list[Action]], db: SourceDB,
                  profile: str | PackProfile = "q4"):
     profile = pack_profile(profile)
-    print(
-        "DS4 Qwen3.8-Flash-Next pack plan" if profile.name == "q4" else
-        "DS4 Qwen3.8-Flash-Next Q2 pack plan"
+    title = {
+        "q4": "DS4 Qwen3.8-Flash-Next pack plan",
+        "q2": "DS4 Qwen3.8-Flash-Next Q2 pack plan",
+    }.get(
+        profile.name,
+        f"DS4 Qwen3.8-Flash-Next {profile.name.upper()} pack plan",
     )
+    print(title)
     print(f"source tensors: {len(db.tensors)}")
     type_bytes: dict[str, int] = {}
     for name in ("base", "vision", "mtp"):
@@ -2985,16 +3092,21 @@ def plan_summary(plan: dict[str, list[Action]], db: SourceDB,
     ngram = [name for name in db.tensors if NGRAM_MARK in name]
     ple_rows = sum(db.tensors[name]["shape"][0] for name in ngram)
     print(f"ple: source_shards={len(ngram)} rows={ple_rows}")
-    if profile.name == "q2":
+    if profile.q2_experts:
+        ple_qtype = profile.ple_qtype
         print(
-            "q2_recipe: gate_up=IQ2_XXS down=Q2_K dense=Q8_0 "
-            "embedding_control=BF16 ple=Q4_1"
+            "q2_recipe: gate_up=IQ2_XXS down=Q2_K "
+            f"spine={profile.spine_qtype} "
+            f"embedding_control=BF16 ple={ple_qtype}"
         )
         for qtype, nbytes in sorted(type_bytes.items()):
             print(f"type_bytes: {qtype} {nbytes}")
-        ple_bytes = ple_rows * (
-            CONFIG["ple_row_dim"] // QTYPE_LAYOUT["Q4_1"][0]
-        ) * QTYPE_LAYOUT["Q4_1"][1]
+        if ple_qtype == "BF16":
+            ple_bytes = ple_rows * CONFIG["ple_row_dim"] * 2
+        else:
+            ple_bytes = ple_rows * (
+                CONFIG["ple_row_dim"] // QTYPE_LAYOUT[ple_qtype][0]
+            ) * QTYPE_LAYOUT[ple_qtype][1]
         base_bytes = sum(
             spec.nbytes for action in plan["base"] for spec in action.specs
         )
@@ -3017,7 +3129,11 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--profile", choices=tuple(PACK_PROFILES), default="q4",
-        help="pack recipe: q4 keeps pack v3; q2 emits mixed-IQ2/Q2 pack v4",
+        help=(
+            "pack recipe: q4 keeps pack v3; q2 emits mixed-IQ2/Q2 pack v4; "
+            "q2bf16 keeps the same Q2 experts but writes the whole "
+            "non-expert spine and the n-gram PLE table as BF16"
+        ),
     )
     parser.add_argument("--src", required=True, type=Path,
                         help="official checkpoint or local metadata directory")
@@ -3088,14 +3204,15 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.threads < 1 or args.threads > 64:
         parser.error("--threads must be between 1 and 64")
-    if args.profile == "q4" and args.imatrix is not None:
-        parser.error("--imatrix applies only to --profile q2")
-    if args.profile == "q2" and not args.dry_run and args.imatrix is None:
-        parser.error("--profile q2 requires --imatrix")
-    if args.profile == "q2" and not args.no_mtp:
+    q2_experts = PACK_PROFILES[args.profile].q2_experts
+    if not q2_experts and args.imatrix is not None:
+        parser.error("--imatrix applies only to the Q2 profiles")
+    if q2_experts and not args.dry_run and args.imatrix is None:
+        parser.error(f"--profile {args.profile} requires --imatrix")
+    if q2_experts and not args.no_mtp:
         if args.mtp_imatrix != "weight-energy":
             parser.error(
-                "--profile q2 with an MTP sidecar requires "
+                f"--profile {args.profile} with an MTP sidecar requires "
                 "--mtp-imatrix weight-energy (no calibrated MTP expert "
                 "imatrix exists; the deterministic per-expert weight-energy "
                 "fallback is the only supported selection)"
@@ -3116,7 +3233,7 @@ def main(argv=None):
     if (len(args.source_revision) != 40 or
             any(ch not in "0123456789abcdefABCDEF" for ch in args.source_revision)):
         fail("--source-revision must be a 40-character immutable commit SHA")
-    if (profile.name == "q2" and
+    if (profile.q2_experts and
             (len(args.imatrix_revision) != 40 or
              any(ch not in "0123456789abcdefABCDEF"
                  for ch in args.imatrix_revision))):
@@ -3125,7 +3242,7 @@ def main(argv=None):
     MTP_IMATRIX_MODE = args.mtp_imatrix
     imatrix = None
     try:
-        if profile.name == "q2" and args.imatrix is not None:
+        if profile.q2_experts and args.imatrix is not None:
             imatrix = QwenGGUFImatrix(
                 args.imatrix,
                 expected_sha256=Q2_IMATRIX_SHA256,
@@ -3139,7 +3256,7 @@ def main(argv=None):
         validate_source_config(SOURCE.config)
         plan = build_plan(
             SOURCE, profile,
-            include_mtp=(profile.name == "q4" or not args.no_mtp),
+            include_mtp=(not profile.q2_experts or not args.no_mtp),
         )
         validate_artifact_tensor_counts(
             plan,
@@ -3155,7 +3272,7 @@ def main(argv=None):
             args.quants_library or default_quantizer_library()
         )
         identity = profile.pack_identity + "\0" + args.source_revision
-        if profile.name == "q2":
+        if profile.q2_experts:
             identity += (
                 "\0" + imatrix.sha256 + "\0" + args.imatrix_revision
             )

@@ -153,7 +153,11 @@ the responses and diagnostics for inspection; it does not grade image content.
 
 The Metal and CUDA graphs accept Q8_0, Q4_0, F16, BF16 and F32
 dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
-hyper-connection mixers and the original BF16 n-gram table.
+hyper-connection mixers and the original BF16 n-gram table. Metal also
+accepts a full BF16 spine (dense projections, hyper-connection mixers and
+gammas, PLE taps, router rows and norms), with native bfloat reads on the
+M3+ path and an F32-converting fallback; the CUDA path keeps F32 control
+tensors.
 Tensor parallelism, pipeline execution and SSD expert streaming are not
 implemented for this model yet.
 ROCm is not supported. CPU code is a correctness reference, not a general
